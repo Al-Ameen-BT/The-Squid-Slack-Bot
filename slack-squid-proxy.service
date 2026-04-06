@@ -1,0 +1,28 @@
+[Unit]
+Description=Slack Squid Proxy Automation Bot
+After=network.target squid.service
+Wants=squid.service
+
+[Service]
+Type=simple
+User=squid
+WorkingDirectory=/opt/slack-squid-proxy
+EnvironmentFile=/opt/slack-squid-proxy/.env
+ExecStart=/usr/bin/python3 /opt/slack-squid-proxy/bot.py
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/etc/squid/lists /etc/squid/conf.d
+
+# Resource limits
+MemoryLimit=512M
+CPUQuota=50%
+
+[Install]
+WantedBy=multi-user.target
