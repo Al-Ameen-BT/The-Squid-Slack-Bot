@@ -21,6 +21,7 @@ from playwright.sync_api import sync_playwright
 # ------------------------------------------------
 SLACK_BOT_TOKEN = os.environ.get("SLACK_BOT_TOKEN")
 SLACK_APP_TOKEN = os.environ.get("SLACK_APP_TOKEN")
+SLACK_LOG_CHANNEL  = os.environ.get("SLACK_LOG_CHANNEL")
 
 LIST_DIR = "/etc/squid/lists"
 DOMAINS_FILE = "/etc/squid/domains.json"
@@ -53,16 +54,63 @@ last_reload = 0
 CDN_LIST = []
 
 # ------------------------------------------------
-# DYNAMIC CDN LOADING (NEW & CRITICAL)
+# DISCOVERY FILTER CONFIG  (loaded from filter_config.json)
+# Edit filter_config.json to add/remove blocked domains or change
+# allowed resource types — no bot restart required.
 # ------------------------------------------------
+
+FILTER_CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "filter_config.json")
+
+def load_filter_config():
+    """
+    Reads filter_config.json and returns:
+      blocklist      : set of root domains to hard-block during discovery
+      resource_types : set of Playwright resource types to count as real deps
+
+    Falls back to safe built-in defaults if the file is missing or malformed.
+    """
+    defaults_blocklist = {
+        "facebook.com", "youtube.com", "twitter.com", "instagram.com",
+        "google-analytics.com", "googletagmanager.com", "doubleclick.net"
+    }
+    defaults_types = {"document", "script", "fetch", "xhr", "websocket", "eventsource", "other"}
+
+    if not os.path.exists(FILTER_CONFIG_FILE):
+        log.warning("filter_config.json not found — using built-in defaults.")
+        return defaults_blocklist, defaults_types
+
+    try:
+        with open(FILTER_CONFIG_FILE, "r") as f:
+            cfg = json.load(f)
+
+        # Flatten all blocklist categories into one set, skip _comment keys
+        combined = set()
+        for category, entries in cfg.get("blocklist", {}).items():
+            if category == "_comment":
+                continue
+            if isinstance(entries, list):
+                combined.update(d.lower().strip() for d in entries)
+
+        resource_types = set(cfg.get("functional_resource_types", list(defaults_types)))
+
+        log.info(f"Filter config loaded: {len(combined)} blocked domains, {len(resource_types)} resource types")
+        return combined, resource_types
+
+    except Exception as e:
+        log.error(f"Failed to load filter_config.json: {e} — using built-in defaults.")
+        return defaults_blocklist, defaults_types
+
+
 
 def get_cdn_domains():
     """Reads the CDN list from the external file. Fixes YouTube buffering."""
     if not os.path.exists(CDN_DOMAINS_FILE):
-        # Fallback to essential defaults if file is missing
+        # Fallback to essential infrastructure CDNs only.
+        # NOTE: youtube/media CDNs deliberately excluded — they get pulled
+        # in by every site with an embed, causing unintended whitelisting.
         return [
             "cloudflare.com", "fastly.net", "akamai.net", "cloudfront.net",
-            "gstatic.com", "googleapis.com", "googlevideo.com", "ytimg.com"
+            "gstatic.com", "googleapis.com"
         ]
     
     with open(CDN_DOMAINS_FILE, "r") as f:
@@ -291,8 +339,12 @@ def load_domains():
     except: return {}
 
 def save_domains(data):
-    with open(DOMAINS_FILE, "w") as f:
+    # Atomic write: write to .tmp first, then rename.
+    # Prevents empty/corrupt domains.json if the bot crashes mid-write.
+    tmp = DOMAINS_FILE + ".tmp"
+    with open(tmp, "w") as f:
         json.dump(data, f, indent=2)
+    os.replace(tmp, DOMAINS_FILE)
 
 def normalize(domain):
 
@@ -338,6 +390,28 @@ def reload_squid(respond=None):
                 respond(f"❌ Reload failed: {result.stderr.decode()}")
 
 # ------------------------------------------------
+# AUDIT LOGGER
+# Posts structured action records to SLACK_LOG_CHANNEL.
+# Fire-and-forget: a Slack API failure never breaks command execution.
+# Set channel message retention to 15 days in Slack Admin settings.
+# ------------------------------------------------
+
+def audit_log(action: str, user_id: str, user_name: str, details: str, status: str = "✅ Success"):
+    """Post a structured audit log entry to the dedicated log channel."""
+    if not SLACK_LOG_CHANNEL:
+        return
+    timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    text = (
+        f"{status} *[{action}]* by <@{user_id}> (`{user_name}`)\n"
+        f"{details}\n"
+        f"📅 `{timestamp}`"
+    )
+    try:
+        app.client.chat_postMessage(channel=SLACK_LOG_CHANNEL, text=text)
+    except Exception as e:
+        log.error(f"audit_log: failed to post to Slack: {e}")
+
+# ------------------------------------------------
 # DOMAIN DISCOVERY WITH PLAYWRIGHT (NEW & IMPROVED)
 # ------------------------------------------------
 
@@ -357,26 +431,58 @@ def discover(domain, respond):
     # Pages to scan beyond root
     EXTRA_PATHS = ["/login", "/signin", "/app", "/dashboard", "/api"]
 
+    # Load filter config fresh on every scan — no restart needed after edits
+    social_ad_blocklist, functional_resource_types = load_filter_config()
+
     def capture_requests(page):
         """Attach request interceptor to a page."""
+
+        def is_noise(host: str) -> bool:
+            """
+            Returns True if this host should be excluded from discovered deps.
+            Checks:
+              1. Direct match against blocklist
+              2. tldextract root domain match (catches all subdomains)
+            """
+            host = host.lower().lstrip(".")
+            if host in social_ad_blocklist:
+                return True
+            ext = tldextract.extract(host)
+            root = f"{ext.domain}.{ext.suffix}"
+            return root in social_ad_blocklist
+
         def on_request(req):
             try:
+                # FILTER 1: Only count functional request types.
+                # image/media/font are embeds, ads, and tracking pixels.
+                if req.resource_type not in functional_resource_types:
+                    return
+
                 host = urlparse(req.url).hostname
-                if host:
-                    d = classify(host)
-                    if d:
-                        discovered.add(d)
+                if not host:
+                    return
+
+                # FILTER 2: Hard-block social/ad/analytics domains.
+                if is_noise(host):
+                    return
+
+                d = classify(host)
+                if d:
+                    discovered.add(d)
             except:
                 pass
 
         def on_frame(frame):
-            """Capture iframe src domains."""
+            """Capture iframe src domains — apply same filters."""
             try:
                 host = urlparse(frame.url).hostname
-                if host:
-                    d = classify(host)
-                    if d:
-                        discovered.add(d)
+                if not host:
+                    return
+                if is_noise(host):
+                    return
+                d = classify(host)
+                if d:
+                    discovered.add(d)
             except:
                 pass
 
@@ -654,6 +760,17 @@ def allow_cmd(ack, respond, command):
     regenerate_squid_configs()
     reload_squid()
     respond(f"✅ *Allowed:* {domain} is now accessible for {ip} {time_text}")
+    audit_log(
+        action="ALLOW",
+        user_id=command["user_id"],
+        user_name=command["user_name"],
+        details=(
+            f"• IP: `{ip}`\n"
+            f"• Domain: `{domain}`\n"
+            f"• Expiry: {time_text}\n"
+            f"• Dependencies discovered: `{len(deps)}`"
+        )
+    )
 
 # ------------------------------------------------
 # DENY
@@ -679,25 +796,25 @@ def deny_cmd(ack, respond, command):
     domain = normalize(domain)
     key = f"{ip}:{domain}"
 
+    # Collect outcome inside the lock — respond() is an HTTP call and must
+    # never be made while holding the lock (would block the expiry worker).
+    not_found = False
+    remaining_deps = set()
+
     with lock:
-
         db = load_domains()
-
         if key not in db:
-            respond(f"⚠️ `{domain}` not found for `{ip}`")
-            return
+            not_found = True
+        else:
+            del db[key]
+            save_domains(db)
+            for entry in db.values():
+                if entry["ip"] == ip:
+                    remaining_deps.update(entry["deps"])
 
-        # Remove from database
-        del db[key]
-
-        save_domains(db)
-
-        # Recalculate dependencies for this IP
-        remaining_deps = set()
-
-        for entry in db.values():
-            if entry["ip"] == ip:
-                remaining_deps.update(entry["deps"])
+    if not_found:
+        respond(f"⚠️ `{domain}` not found for `{ip}`")
+        return
 
     # --- Rewrite IP ACL file (outside lock) ---
 
@@ -715,6 +832,15 @@ def deny_cmd(ack, respond, command):
     reload_squid()
 
     respond(f"🚫 `{domain}` removed from `{ip}`")
+    audit_log(
+        action="DENY",
+        user_id=command["user_id"],
+        user_name=command["user_name"],
+        details=(
+            f"• IP: `{ip}`\n"
+            f"• Domain: `{domain}` — access revoked"
+        )
+    )
 
 
 
@@ -752,41 +878,63 @@ def extend_cmd(ack, respond, command):
 
     key = f"{ip}:{domain}"
 
+    # Use a result code so all respond() calls happen OUTSIDE the lock.
+    # respond() is an HTTP call — holding the lock during it blocks everything.
+    result = None
+
     with lock:
-
         db = load_domains()
-
         if key not in db:
-            respond(f"⚠️ No active rule found for `{domain}` on `{ip}`")
-            return
+            result = "not_found"
+        else:
+            entry = db[key]
+            now = datetime.now(timezone.utc).timestamp()
+            if not entry.get("expires"):
+                result = "no_expiry"
+            else:
+                current_expiry = entry["expires"]
+                base_time = max(now, current_expiry)
+                entry["expires"] = base_time + extra_seconds
+                db[key] = entry
+                save_domains(db)
+                result = "ok"
 
-        entry = db[key]
-
-        now = datetime.now(timezone.utc).timestamp()
-
-        # If already expired or unlimited
-        if not entry.get("expires"):
-            respond(f"⚠️ `{domain}` for `{ip}` has no expiry to extend.")
-            return
-
-        current_expiry = entry["expires"]
-
-        # Extend from whichever is later (now or current expiry)
-        base_time = max(now, current_expiry)
-
-        new_expiry = base_time + extra_seconds
-
-        entry["expires"] = new_expiry
-
-        db[key] = entry
-
-        save_domains(db)
+    if result == "not_found":
+        respond(f"⚠️ No active rule found for `{domain}` on `{ip}`")
+        audit_log(
+            action="EXTEND",
+            user_id=command["user_id"],
+            user_name=command["user_name"],
+            details=f"• IP: `{ip}`\n• Domain: `{domain}` — rule not found",
+            status="⚠️ Not Found"
+        )
+        return
+    if result == "no_expiry":
+        respond(f"⚠️ `{domain}` for `{ip}` has no expiry to extend.")
+        audit_log(
+            action="EXTEND",
+            user_id=command["user_id"],
+            user_name=command["user_name"],
+            details=f"• IP: `{ip}`\n• Domain: `{domain}` — rule is permanent (no expiry)",
+            status="⚠️ Skipped"
+        )
+        return
 
     respond(
         f"⏱️ *Extended access*\n"
         f"IP: `{ip}`\n"
         f"Domain: `{domain}`\n"
         f"Added: `{hours}h`"
+    )
+    audit_log(
+        action="EXTEND",
+        user_id=command["user_id"],
+        user_name=command["user_name"],
+        details=(
+            f"• IP: `{ip}`\n"
+            f"• Domain: `{domain}`\n"
+            f"• Added: `{hours}h`"
+        )
     )
 
 # ------------------------------------------------
@@ -806,6 +954,13 @@ def fullnet_cmd(ack, respond, command):
         with open(path, "w") as f: f.write(rule)
     reload_squid()
     respond(f"🔓 *Full Internet Enabled* for {ip}")
+    audit_log(
+        action="FULL-NET",
+        user_id=command["user_id"],
+        user_name=command["user_name"],
+        details=f"• IP: `{ip}` — unrestricted internet access granted",
+        status="🔓 Enabled"
+    )
 
 # ------------------------------------------------
 # COMMAND: LOCK NET
@@ -814,15 +969,30 @@ def fullnet_cmd(ack, respond, command):
 def locknet_cmd(ack, respond, command):
     ack()
     ip = command["text"].strip()
+    if not validate_ip(ip):
+        respond("❌ Invalid IP")
+        return
     path = os.path.join(FULLNET_DIR, f"{ip}.conf")
+    did_disable = False
     with lock:
         if os.path.exists(path):
             with open(path, "w") as f:
                 f.write("# Disabled by /lock-net command\n")
-            reload_squid()
-            respond(f"🔒 *Restrictions Restored* for {ip}")
-        else:
-            respond(f"Note: No full-net override found for {ip}")
+            did_disable = True
+    # reload_squid() called OUTSIDE lock — it acquires the same lock
+    # internally and would deadlock if called from within the with lock: block.
+    if did_disable:
+        reload_squid()
+        respond(f"🔒 *Restrictions Restored* for `{ip}`")
+        audit_log(
+            action="LOCK-NET",
+            user_id=command["user_id"],
+            user_name=command["user_name"],
+            details=f"• IP: `{ip}` — full-net access revoked, normal restrictions restored",
+            status="🔒 Locked"
+        )
+    else:
+        respond(f"⚠️ No full-net override found for `{ip}`")
 
 # ------------------------------------------------
 # COMMAND: LIST
@@ -834,14 +1004,24 @@ def list_cmd(ack, respond, command):
     if not validate_ip(ip):
         respond("Usage: `/list <ip>`")
         return
-        
-    db = load_domains()
-    ip_rules = [entry for entry in db.values() if entry["ip"] == ip]
-    
+
+    # Read under lock to avoid racing with expiry worker mid-write
+    with lock:
+        db = load_domains()
+
+    # Filter out already-expired entries (expiry worker cleans every 60s,
+    # so entries in the cleanup window would otherwise show as still active)
+    now = datetime.now(timezone.utc).timestamp()
+    ip_rules = [
+        entry for entry in db.values()
+        if entry["ip"] == ip
+        and (not entry.get("expires") or entry["expires"] > now)
+    ]
+
     if not ip_rules:
-        respond(f"No specific rules found for `{ip}`")
+        respond(f"No active rules found for `{ip}`")
         return
-        
+
     lines = [f"Allowed domains for `{ip}`:"]
     for idx, rule in enumerate(sorted(ip_rules, key=lambda x: x["domain"])):
         domain = rule["domain"]
@@ -850,10 +1030,67 @@ def list_cmd(ack, respond, command):
             dt = datetime.fromtimestamp(expires, timezone.utc)
             expiry_str = f"expires {dt.strftime('%Y-%m-%d %H:%M:%S UTC')}"
         else:
-            expiry_str = "indefinitely"
-        lines.append(f"{idx+1}. `{domain}` - {expiry_str}")
-        
-    respond("\n".join(lines))
+            expiry_str = "indefinitely ♾️"
+        lines.append(f"{idx+1}. `{domain}` — {expiry_str}")
+
+    response_text = "\n".join(lines)
+    # Guard against Slack's ~4000 char block limit
+    if len(response_text) > 3800:
+        response_text = response_text[:3800] + "\n… *(truncated — too many entries)*"
+    respond(response_text)
+
+# ------------------------------------------------
+# SQUID MONITOR WORKER
+# ------------------------------------------------
+
+def squid_monitor_worker():
+    if not SLACK_LOG_CHANNEL:
+        log.warning("SLACK_LOG_CHANNEL not set. Squid crash alerts disabled.")
+        return
+
+    squid_was_down = False
+
+    while True:
+        try:
+            result = subprocess.run(["systemctl", "is-active", "squid"], capture_output=True, text=True)
+            is_active = result.stdout.strip() == "active"
+            timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+            if not is_active and not squid_was_down:
+                squid_was_down = True
+                log.error("Squid status monitor: Squid is offline!")
+                try:
+                    app.client.chat_postMessage(
+                        channel=SLACK_LOG_CHANNEL,
+                        text=(
+                            f"🚨 *[SQUID-DOWN]*\n"
+                            f"• The Squid proxy engine has gone *offline* or failed to reload.\n"
+                            f"• Action required: check the proxy server immediately.\n"
+                            f"📅 `{timestamp}`"
+                        )
+                    )
+                except Exception as e:
+                    log.error(f"Failed to send Squid crash alert: {e}")
+
+            elif is_active and squid_was_down:
+                squid_was_down = False
+                log.info("Squid status monitor: Squid is back online.")
+                try:
+                    app.client.chat_postMessage(
+                        channel=SLACK_LOG_CHANNEL,
+                        text=(
+                            f"✅ *[SQUID-RECOVERY]*\n"
+                            f"• The Squid proxy engine is back *online* and functioning normally.\n"
+                            f"📅 `{timestamp}`"
+                        )
+                    )
+                except Exception as e:
+                    log.error(f"Failed to send Squid recovery alert: {e}")
+
+        except Exception as e:
+            log.error(f"Squid monitor encountered an error: {e}")
+
+        time.sleep(30)
 
 # ------------------------------------------------
 # STARTUP
@@ -865,6 +1102,11 @@ if __name__ == "__main__":
 
     threading.Thread(
         target=expiry_worker,
+        daemon=True
+    ).start()
+
+    threading.Thread(
+        target=squid_monitor_worker,
         daemon=True
     ).start()
 
