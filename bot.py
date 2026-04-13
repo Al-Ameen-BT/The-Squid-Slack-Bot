@@ -109,6 +109,32 @@ def load_filter_config():
         return defaults_blocklist, defaults_types
 
 
+def load_full_access_domains():
+    """
+    Reads the full_access_domains section from filter_config.json.
+    Returns a flat set of root domains whose /allow requests should
+    automatically trigger full-net access instead of domain whitelisting.
+
+    Used for relay-based tools (UltraViewer, AnyDesk, TeamViewer, etc.)
+    whose server IPs change dynamically and can't be reliably whitelisted.
+    """
+    if not os.path.exists(FILTER_CONFIG_FILE):
+        return set()
+    try:
+        with open(FILTER_CONFIG_FILE, "r") as f:
+            cfg = json.load(f)
+        result = set()
+        for category, entries in cfg.get("full_access_domains", {}).items():
+            if category == "_comment" or not isinstance(entries, list):
+                continue
+            result.update(d.lower().strip() for d in entries)
+        return result
+    except Exception as e:
+        log.warning(f"load_full_access_domains: {e}")
+        return set()
+
+
+
 
 def get_cdn_domains():
     """Reads the CDN list from the external file. Fixes YouTube buffering."""
@@ -778,12 +804,48 @@ def allow_cmd(ack, respond, command):
         return
 
     domain = normalize(domain)
-    
+
     if not validate_domain(domain):
         respond(f"❌ Invalid domain: {domain}")
         return
-    
+
+    # --- Full-net override for relay-based tools ---
+    # Domains like UltraViewer, AnyDesk, TeamViewer route through dynamically
+    # assigned relay IPs — domain whitelisting is unreliable for these.
+    # If the requested domain is in full_access_domains, automatically grant
+    # full-net access to the IP instead and skip the dependency scanner.
+    domain_root = f"{tldextract.extract(domain).domain}.{tldextract.extract(domain).suffix}"
+    full_access_set = load_full_access_domains()
+
+    if domain_root in full_access_set or domain.lower() in full_access_set:
+        safe_name = ip.replace(".", "_")
+        path = os.path.join(FULLNET_DIR, f"{ip}.conf")
+        rule = f"# Full-net override for {ip} (auto: {domain} is a relay-based tool)\nacl fullnet_{safe_name} src {ip}\nhttp_access allow fullnet_{safe_name}\n"
+        with lock:
+            with open(path, "w") as f:
+                f.write(rule)
+        reload_squid()
+        respond(
+            f"🔓 *Full Internet Access Granted* for `{ip}`\n"
+            f"• Reason: `{domain}` uses dynamic relay servers that cannot be whitelisted by domain.\n"
+            f"• Effect: all outbound traffic from `{ip}` is now permitted.\n"
+            f"• Use `/lock-net {ip}` to revoke when the session is done."
+        )
+        audit_log(
+            action="ALLOW→FULL-NET",
+            user_id=command["user_id"],
+            user_name=command["user_name"],
+            details=(
+                f"• IP: `{ip}`\n"
+                f"• Requested: `{domain}` (relay-based tool — auto-upgraded to full-net)\n"
+                f"• Full internet access granted"
+            ),
+            status="🔓 Auto Full-Net"
+        )
+        return
+
     respond(f"⚙️ Processing {domain} for {ip}...")
+
 
     deps = discover(domain, respond)
     base = classify(domain)

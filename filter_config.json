@@ -1,6 +1,17 @@
 {
   "_comment": "Discovery filter config. Edit freely — bot reloads this on every /allow scan. No restart needed.",
 
+  "full_access_domains": {
+    "_comment": "Domains listed here trigger automatic full-net access for the requesting IP. Use for remote desktop and relay-based tools whose server IPs change dynamically and cannot be reliably whitelisted by domain.",
+    "remote_desktop": [
+      "ultraviewer.net",
+      "anydesk.com",
+      "teamviewer.com",
+      "rustdesk.com",
+      "supremocontrol.com",
+      "getscreen.me"
+    ]
+  },
   "functional_resource_types": [
     "document",
     "script",
