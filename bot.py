@@ -375,28 +375,38 @@ def reload_squid(respond=None):
     with lock:
         now = time.time()
         if now - last_reload < 5:
+            log.debug("reload_squid: skipped (rate limit — called within 5s of last reload)")
             return
 
         # Run as root — call squid directly, no sudo needed
         test = subprocess.run(["/usr/sbin/squid", "-k", "parse"], capture_output=True)
+        parse_out = test.stdout.decode().strip()
+        parse_err = test.stderr.decode().strip()
         if test.returncode != 0:
-            msg = f"Squid config parse error: {test.stderr.decode().strip()}"
+            detail = parse_err or parse_out or "(no output)"
+            msg = f"Squid config parse error (exit {test.returncode}): {detail}"
             log.error(msg)
             if respond:
-                respond(f"❌ Squid config error:\n{test.stderr.decode()}")
+                respond(f"❌ Squid config parse error:\n```{detail}```")
             return
+
+        if parse_err:
+            log.warning(f"Squid parse warnings: {parse_err}")
 
         result = subprocess.run(["/usr/sbin/squid", "-k", "reconfigure"], capture_output=True)
         last_reload = now
+        reconf_out = result.stdout.decode().strip()
+        reconf_err = result.stderr.decode().strip()
 
         if result.returncode == 0:
             log.info("Squid reloaded successfully")
             if respond:
                 respond("🧾 Squid configuration reloaded")
         else:
-            log.error(f"Squid reload failed: {result.stderr.decode().strip()}")
+            detail = reconf_err or reconf_out or "(no output)"
+            log.error(f"Squid reload failed (exit {result.returncode}): {detail}")
             if respond:
-                respond(f"❌ Reload failed: {result.stderr.decode()}")
+                respond(f"❌ Reload failed:\n```{detail}```")
 
 # ------------------------------------------------
 # AUDIT LOGGER
