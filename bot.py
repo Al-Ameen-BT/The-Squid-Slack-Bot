@@ -399,11 +399,6 @@ def normalize(domain):
 def reload_squid(respond=None):
     global last_reload
     with lock:
-        now = time.time()
-        if now - last_reload < 5:
-            log.debug("reload_squid: skipped (rate limit — called within 5s of last reload)")
-            return
-
         # Run as root — call squid directly, no sudo needed
         test = subprocess.run(["/usr/sbin/squid", "-k", "parse"], capture_output=True)
         parse_out = test.stdout.decode().strip()
@@ -420,14 +415,14 @@ def reload_squid(respond=None):
             log.warning(f"Squid parse warnings: {parse_err}")
 
         result = subprocess.run(["/usr/sbin/squid", "-k", "reconfigure"], capture_output=True)
-        last_reload = now
+        last_reload = time.time()
         reconf_out = result.stdout.decode().strip()
         reconf_err = result.stderr.decode().strip()
 
         if result.returncode == 0:
             log.info("Squid reloaded successfully")
             if respond:
-                respond("🧾 Squid configuration reloaded")
+                respond("🧾 Squid reloaded")
         else:
             detail = reconf_err or reconf_out or "(no output)"
             log.error(f"Squid reload failed (exit {result.returncode}): {detail}")
@@ -596,7 +591,7 @@ def discover(domain, respond):
             # ----------------------------------------
             # Page 1: Root domain
             # ----------------------------------------
-            respond(f"🌐 Scanning root: https://{domain}")
+           
             page = context.new_page()
             capture_requests(page)
 
