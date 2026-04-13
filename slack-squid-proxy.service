@@ -15,7 +15,9 @@ StandardOutput=journal
 StandardError=journal
 
 # Security hardening
-NoNewPrivileges=true
+# NOTE: NoNewPrivileges is intentionally NOT set — the bot must call
+# `sudo squid -k reconfigure` which requires sudo's setuid bit to work.
+# Privilege scope is restricted via /etc/sudoers.d/slack-squid-bot instead.
 ProtectSystem=strict
 ProtectHome=yes
 ReadWritePaths=/etc/squid /etc/squid/lists /etc/squid/conf.d
