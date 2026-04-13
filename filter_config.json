@@ -1,15 +1,12 @@
 {
   "_comment": "Discovery filter config. Edit freely — bot reloads this on every /allow scan. No restart needed.",
-
   "full_access_domains": {
     "_comment": "Domains listed here trigger automatic full-net access for the requesting IP. Use for remote desktop and relay-based tools whose server IPs change dynamically and cannot be reliably whitelisted by domain.",
     "remote_desktop": [
       "ultraviewer.net",
       "anydesk.com",
       "teamviewer.com",
-      "rustdesk.com",
-      "supremocontrol.com",
-      "getscreen.me"
+      "rustdesk.com"
     ]
   },
   "functional_resource_types": [
@@ -21,10 +18,8 @@
     "eventsource",
     "other"
   ],
-
   "blocklist": {
     "_comment": "Root domains added here (and ALL their subdomains) are excluded from auto-discovered dependencies.",
-
     "social_media": [
       "facebook.com",
       "fbcdn.net",
@@ -61,7 +56,6 @@
       "telegra.ph",
       "tumblr.com"
     ],
-
     "analytics_and_tracking": [
       "google-analytics.com",
       "googletagmanager.com",
@@ -85,7 +79,6 @@
       "nr-data.net",
       "sentry.io"
     ],
-
     "live_chat_and_crm": [
       "intercom.io",
       "intercom.com",
@@ -105,7 +98,6 @@
       "freshdesk.com",
       "tawk.to"
     ],
-
     "ad_networks": [
       "adnxs.com",
       "advertising.com",
