@@ -29,7 +29,7 @@ from playwright.sync_api import sync_playwright
 # ------------------------------------------------
 SLACK_BOT_TOKEN = os.environ.get("SLACK_BOT_TOKEN")
 SLACK_APP_TOKEN = os.environ.get("SLACK_APP_TOKEN")
-SLACK_LOG_CHANNEL  = os.environ.get("SLACK_LOG_CHANNEL")
+SLACK_LOG_CHANNEL = os.environ.get("SLACK_LOG_CHANNEL")
 
 LIST_DIR = "/etc/squid/lists"
 DOMAINS_FILE = "/etc/squid/domains.json"
@@ -68,6 +68,7 @@ CDN_LIST = []
 # ------------------------------------------------
 
 FILTER_CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "filter_config.json")
+
 
 def load_filter_config():
     """
@@ -134,10 +135,8 @@ def load_full_access_domains():
         return set()
 
 
-
-
 def get_cdn_domains():
-    """Reads the CDN list from the external file. Fixes YouTube buffering."""
+    """Reads the CDN list from the external file."""
     if not os.path.exists(CDN_DOMAINS_FILE):
         # Fallback to essential infrastructure CDNs only.
         # NOTE: youtube/media CDNs deliberately excluded — they get pulled
@@ -146,14 +145,13 @@ def get_cdn_domains():
             "cloudflare.com", "fastly.net", "akamai.net", "cloudfront.net",
             "gstatic.com", "googleapis.com"
         ]
-    
     with open(CDN_DOMAINS_FILE, "r") as f:
         return [line.strip().lower() for line in f if line.strip()]
+
 
 def classify(domain):
     """
     Normalize a hostname to a whitelistable domain pattern.
-    Fixed:
     - Proper CDN subdomain matching (no false prefix matches)
     - Handles unusual TLDs
     - Strips leading dots safely
@@ -168,12 +166,11 @@ def classify(domain):
 
     # Layer 2: Extract root domain via tldextract
     ext = tldextract.extract(domain)
-
     if not ext.domain or not ext.suffix:
         return None
 
-    # Always group under root domain (subdomains included via dot prefix)
     return f".{ext.domain}.{ext.suffix}"
+
 
 # Initialize CDN list after function is defined
 CDN_LIST = get_cdn_domains()
@@ -182,39 +179,31 @@ CDN_LIST = get_cdn_domains()
 
 def get_host_acls():
     """Extract ACL names from 01-hosts.conf"""
-
     acls = set()
-
     if not os.path.exists(HOSTS_CONF):
         return []
-
     with open(HOSTS_CONF, "r") as f:
         for line in f:
-
             line = line.strip()
-
             if line.startswith("acl"):
-
                 parts = line.split()
-
                 if len(parts) >= 2:
                     acl_name = parts[1]
                     acls.add(acl_name)
-
     return sorted(acls)
 
-#-------------------------------------------------
-# SQUID CONFIG GENERATOR (NEW)
+
+# ------------------------------------------------
+# SQUID CONFIG GENERATOR
 # ------------------------------------------------
 
 def regenerate_squid_configs():
     """
-    Rebuilds 02-domain-lists.conf and 03-rules.conf
-    from:
+    Rebuilds 02-domain-lists.conf and 03-rules.conf from:
       - /etc/squid/lists/groups/*.txt  (group domains)
       - /etc/squid/lists/<ip>.txt      (per-IP domains)
+    Must be called OUTSIDE the lock — does file I/O.
     """
-
     GROUP_DIR = os.path.join(LIST_DIR, "groups")
 
     # Ensure at least one group file exists
@@ -226,38 +215,25 @@ def regenerate_squid_configs():
     ip_files = []
     group_files = []
 
-    # -------------------------
-    # Scan group domain lists
-    # -------------------------
     if os.path.exists(GROUP_DIR):
         for f in os.listdir(GROUP_DIR):
             if f.endswith(".txt"):
                 group_files.append(f)
 
-    # -------------------------
-    # Scan IP domain lists
-    # -------------------------
     for f in os.listdir(LIST_DIR):
-
         full_path = os.path.join(LIST_DIR, f)
-
         if os.path.isdir(full_path):
             continue
-
         if not f.endswith(".txt"):
             continue
-
         ip = f.replace(".txt", "")
-
         try:
             ipaddress.ip_address(ip)
             ip_files.append(f)
         except ValueError:
             continue
 
-    # -------------------------
     # Build domain config
-    # -------------------------
     domain_lines = [
         "# =====================================",
         "# Domain Lists (Auto Generated)",
@@ -265,49 +241,31 @@ def regenerate_squid_configs():
         ""
     ]
 
-    # GROUP DOMAIN ACLS
     domain_lines.append("# GROUP DOMAIN LISTS")
-
     for g in sorted(group_files):
-
         path = os.path.join(GROUP_DIR, g)
-
-        # Skip empty files
         if os.path.getsize(path) == 0:
             continue
-
         name = g.replace(".txt", "")
         safe = name.replace("-", "_")
-
-        domain_lines.append(
-            f'acl group_{safe}_domains dstdomain "{path}"'
-        )
+        domain_lines.append(f'acl group_{safe}_domains dstdomain "{path}"')
 
     domain_lines.append("")
     domain_lines.append("# IP DOMAIN LISTS")
 
     for file in sorted(ip_files):
-
         ip = file.replace(".txt", "")
         safe = ip.replace(".", "_")
         path = os.path.join(LIST_DIR, file)
-
-        # Safety: ensure file exists
         if not os.path.exists(path):
             open(path, "w").close()
-
         domain_lines.append(f'acl ip_{safe} src {ip}')
-        domain_lines.append(
-            f'acl ip_{safe}_domains dstdomain "{path}"'
-        )
+        domain_lines.append(f'acl ip_{safe}_domains dstdomain "{path}"')
 
     with open(DOMAIN_CONF, "w") as f:
         f.write("\n".join(domain_lines) + "\n")
 
-    # -------------------------
     # Build rules config
-    # -------------------------
-
     rule_lines = [
         "# =====================================",
         "# ACCESS RULES (AUTO GENERATED)",
@@ -317,13 +275,9 @@ def regenerate_squid_configs():
     ]
 
     for file in sorted(ip_files):
-
         ip = file.replace(".txt", "")
         safe = ip.replace(".", "_")
-
-        rule_lines.append(
-            f"http_access allow ip_{safe} ip_{safe}_domains"
-        )
+        rule_lines.append(f"http_access allow ip_{safe} ip_{safe}_domains")
 
     rule_lines.append("")
     rule_lines.append("# GROUP RULES (ADMIN MANAGED)")
@@ -338,7 +292,6 @@ def regenerate_squid_configs():
     rule_lines.append("# AUTO DENY FROM HOST ACLS")
 
     host_acls = get_host_acls()
-
     for acl in host_acls:
         rule_lines.append(f"http_access deny {acl}")
 
@@ -351,6 +304,7 @@ def regenerate_squid_configs():
     with open(RULES_CONF, "w") as f:
         f.write("\n".join(rule_lines) + "\n")
 
+
 # ------------------------------------------------
 # VALIDATION & UTILITIES
 # ------------------------------------------------
@@ -362,15 +316,21 @@ def validate_ip(ip):
     except:
         return False
 
+
 def validate_domain(domain):
     ext = tldextract.extract(domain)
     return bool(ext.domain and ext.suffix)
 
+
 def load_domains():
-    if not os.path.exists(DOMAINS_FILE): return {}
+    if not os.path.exists(DOMAINS_FILE):
+        return {}
     try:
-        with open(DOMAINS_FILE) as f: return json.load(f)
-    except: return {}
+        with open(DOMAINS_FILE) as f:
+            return json.load(f)
+    except:
+        return {}
+
 
 def save_domains(data):
     # Atomic write: write to .tmp first, then rename.
@@ -380,36 +340,80 @@ def save_domains(data):
         json.dump(data, f, indent=2)
     os.replace(tmp, DOMAINS_FILE)
 
+
 def normalize(domain):
-
     domain = domain.lower().strip()
-
     if domain.startswith("http"):
         parsed = urlparse(domain)
         domain = parsed.hostname if parsed.hostname else domain
-
     domain = domain.split("/")[0]
-
     return domain
+
+
+# ------------------------------------------------
+# HELPER: rebuild IP file from domains.json
+#
+# FIX: allow_cmd previously merged new deps with the existing IP file
+# using `current | deps`, causing stale domains from old /allow calls to
+# accumulate permanently. Now all IP file writes go through this function,
+# which rebuilds purely from domains.json — the single source of truth.
+# Matches what expiry_worker already did correctly.
+# ------------------------------------------------
+
+def rebuild_ip_file(ip, db):
+    """
+    Rewrites /etc/squid/lists/<ip>.txt based solely on current db entries.
+    File is never deleted — cleared to empty if no rules remain for this IP.
+    Must be called while holding the lock.
+    """
+    all_deps = set()
+    for entry in db.values():
+        if entry["ip"] == ip:
+            all_deps.update(entry["deps"])
+
+    path = os.path.join(LIST_DIR, f"{ip}.txt")
+    with open(path, "w") as f:
+        for d in sorted(all_deps):
+            f.write(d + "\n")
+
 
 # ------------------------------------------------
 # SQUID RELOAD (THREAD SAFE)
+#
+# FIX: The original reload_squid(respond) passed Slack's respond() callback
+# directly into the reload function. respond() is a Slack webhook that expires
+# in ~3 seconds, but Squid's parse + reconfigure can take longer — causing the
+# confirmation message to be silently dropped every time.
+#
+# Solution: reload_squid() now accepts an optional Slack channel ID and posts
+# results via app.client.chat_postMessage(), which has no timeout.
+# All command handlers call respond() BEFORE triggering the reload so the user
+# gets immediate feedback, and the reload result posts asynchronously after.
 # ------------------------------------------------
 
-def reload_squid(respond=None):
+def reload_squid(channel=None):
+    """
+    Parses and reloads Squid config.
+    If channel is provided, posts the result to that Slack channel
+    via chat_postMessage (no webhook timeout risk).
+    Returns True on success, False on failure.
+    """
     global last_reload
     with lock:
-        # Run as root — call squid directly, no sudo needed
         test = subprocess.run(["/usr/sbin/squid", "-k", "parse"], capture_output=True)
         parse_out = test.stdout.decode().strip()
         parse_err = test.stderr.decode().strip()
+
         if test.returncode != 0:
             detail = parse_err or parse_out or "(no output)"
-            msg = f"Squid config parse error (exit {test.returncode}): {detail}"
+            msg = f"❌ Squid config parse error (exit {test.returncode}):\n```{detail}```"
             log.error(msg)
-            if respond:
-                respond(f"❌ Squid config parse error:\n```{detail}```")
-            return
+            if channel:
+                try:
+                    app.client.chat_postMessage(channel=channel, text=msg)
+                except Exception as e:
+                    log.error(f"reload_squid: failed to post parse error: {e}")
+            return False
 
         if parse_err:
             log.warning(f"Squid parse warnings: {parse_err}")
@@ -421,13 +425,23 @@ def reload_squid(respond=None):
 
         if result.returncode == 0:
             log.info("Squid reloaded successfully")
-            if respond:
-                respond("🧾 Squid reloaded")
+            if channel:
+                try:
+                    app.client.chat_postMessage(channel=channel, text="🧾 Squid reloaded successfully")
+                except Exception as e:
+                    log.error(f"reload_squid: failed to post reload success: {e}")
+            return True
         else:
             detail = reconf_err or reconf_out or "(no output)"
-            log.error(f"Squid reload failed (exit {result.returncode}): {detail}")
-            if respond:
-                respond(f"❌ Reload failed:\n```{detail}```")
+            msg = f"❌ Reload failed (exit {result.returncode}):\n```{detail}```"
+            log.error(msg)
+            if channel:
+                try:
+                    app.client.chat_postMessage(channel=channel, text=msg)
+                except Exception as e:
+                    log.error(f"reload_squid: failed to post reload error: {e}")
+            return False
+
 
 # ------------------------------------------------
 # AUDIT LOGGER
@@ -451,35 +465,31 @@ def audit_log(action: str, user_id: str, user_name: str, details: str, status: s
     except Exception as e:
         log.error(f"audit_log: failed to post to Slack: {e}")
 
+
 # ------------------------------------------------
-# DOMAIN DISCOVERY WITH PLAYWRIGHT (NEW & IMPROVED)
+# DOMAIN DISCOVERY WITH PLAYWRIGHT
 # ------------------------------------------------
 
 def discover(domain, respond):
     """
-    Improved dependency scanner.
-    Fixed:
+    Dependency scanner using Playwright.
     - Follows redirects (tracks final URL)
     - Captures lazy/deferred resources (scroll + interactions)
-    - Uses networkidle instead of domcontentloaded
     - Scans multiple pages (root + login + common subpages)
-    - Captures iframes and web workers
+    - Captures iframes via framenavigated
     """
     discovered = set()
     respond("🔎 Searching...")
 
-    # Pages to scan beyond root
     EXTRA_PATHS = ["/login", "/signin", "/app", "/dashboard", "/api"]
 
     # Load filter config fresh on every scan — no restart needed after edits
     social_ad_blocklist, functional_resource_types = load_filter_config()
 
-    # --- Explicit domain override ---
     # If the requested domain is itself in the blocklist (e.g. youtube.com),
     # temporarily lift that entire blocklist category for THIS scan only.
-    # This lets the domain's own CDNs (googlevideo.com, ytimg.com, etc.)
-    # be discovered as dependencies instead of being silently blocked.
-    # All other categories (analytics, ads, CRM) still apply normally.
+    # This lets the domain's own CDNs be discovered as dependencies instead
+    # of being silently blocked.
     effective_blocklist = set(social_ad_blocklist)
     requested_root = f"{tldextract.extract(domain).domain}.{tldextract.extract(domain).suffix}"
 
@@ -493,22 +503,15 @@ def discover(domain, respond):
                 category_domains = {e.lower().strip() for e in entries}
                 if requested_root in category_domains or domain.lower() in category_domains:
                     effective_blocklist -= category_domains
-                    
                     log.info(f"discover: lifted '{category}' blocklist for explicit request of {domain}")
                     break
         except Exception as e:
-            log.warning(f"Error: Finding {domain}: {e}")
-
+            log.warning(f"Error lifting blocklist for {domain}: {e}")
 
     def capture_requests(page):
         """Attach request interceptor to a page."""
 
         def is_noise(host: str) -> bool:
-            """
-            Returns True if this host should be excluded from discovered deps.
-            Uses effective_blocklist which may have the requested domain's
-            own category lifted when the domain was explicitly requested.
-            """
             host = host.lower().lstrip(".")
             if host in effective_blocklist:
                 return True
@@ -516,22 +519,15 @@ def discover(domain, respond):
             root = f"{ext.domain}.{ext.suffix}"
             return root in effective_blocklist
 
-
         def on_request(req):
             try:
-                # FILTER 1: Only count functional request types.
-                # image/media/font are embeds, ads, and tracking pixels.
                 if req.resource_type not in functional_resource_types:
                     return
-
                 host = urlparse(req.url).hostname
                 if not host:
                     return
-
-                # FILTER 2: Hard-block social/ad/analytics domains.
                 if is_noise(host):
                     return
-
                 d = classify(host)
                 if d:
                     discovered.add(d)
@@ -558,21 +554,15 @@ def discover(domain, respond):
     def interact_page(page):
         """Simulate user interactions to trigger lazy loads."""
         try:
-            # Scroll down in steps to trigger lazy loading
             for scroll_y in [300, 600, 1000, 1500, 2000]:
                 page.mouse.wheel(0, scroll_y)
                 page.wait_for_timeout(500)
-
-            # Move mouse to trigger hover-based loads
             page.mouse.move(640, 400)
             page.wait_for_timeout(500)
-
-            # Wait for any network activity to settle
             try:
                 page.wait_for_load_state("networkidle", timeout=8000)
             except Exception:
-                pass  # timeout is fine, we just want to catch late requests
-
+                pass
         except Exception:
             pass
 
@@ -588,10 +578,7 @@ def discover(domain, respond):
                 viewport={"width": 1280, "height": 800}
             )
 
-            # ----------------------------------------
             # Page 1: Root domain
-            # ----------------------------------------
-           
             page = context.new_page()
             capture_requests(page)
 
@@ -601,8 +588,6 @@ def discover(domain, respond):
                     timeout=30000,
                     wait_until="domcontentloaded"
                 )
-
-                # Track redirect — final URL may be a different domain
                 if response:
                     final_url = response.url
                     final_host = urlparse(final_url).hostname
@@ -610,45 +595,40 @@ def discover(domain, respond):
                         d = classify(final_host)
                         if d:
                             discovered.add(d)
-                        # If redirected to a different domain, scan that too
                         if final_host != domain:
                             respond(f"↪️ Redirect detected: {final_host}")
-
                 interact_page(page)
-
             except Exception as e:
                 respond(f"⚠️ Root scan warning: {e}")
             finally:
                 page.close()
 
-            # ----------------------------------------
             # Page 2+: Common subpages
-            # ----------------------------------------
             for path in EXTRA_PATHS:
                 url = f"https://{domain}{path}"
+                sub_page = None
                 try:
                     sub_page = context.new_page()
                     capture_requests(sub_page)
-
                     sub_resp = sub_page.goto(
                         url,
                         timeout=15000,
                         wait_until="domcontentloaded"
                     )
-
-                    # Only interact if page actually loaded (not 404)
                     if sub_resp and sub_resp.status < 400:
                         respond(f"📄 Scanning: {url}")
                         interact_page(sub_page)
-                    
-                    sub_page.close()
-
-                except:
-                    # Subpage may not exist — silently skip
-                    try:
-                        sub_page.close()
-                    except:
-                        pass
+                except Exception:
+                    pass
+                finally:
+                    # FIX: always close sub_page even if an exception occurred
+                    # mid-scan. Previously the nested try/except could silently
+                    # swallow errors and leak open browser pages.
+                    if sub_page:
+                        try:
+                            sub_page.close()
+                        except Exception:
+                            pass
 
         except Exception as e:
             respond(f"⚠️ Scanner error: {str(e)}")
@@ -659,26 +639,25 @@ def discover(domain, respond):
     respond(f"✅ {len(discovered)} dependencies found")
     return discovered
 
+
 # ------------------------------------------------
 # EXPIRY WORKER
 # ------------------------------------------------
 
-
-
 def expiry_worker():
-
     while True:
-
         changed = False
-
+        db_snapshot = None
         new_cdn_list = get_cdn_domains()
 
         # -----------------------------
-        # Phase 1 — Update DB & Regenerate Files (Under Lock)
+        # Phase 1 — Minimal lock scope: only DB reads/writes
+        # FIX: heavy I/O (file writes, regenerate_squid_configs) moved
+        # OUTSIDE the lock. The previous version moved these back inside,
+        # which blocks all other threads (commands, monitor) for the full
+        # duration of config regeneration.
         # -----------------------------
         with lock:
-
-            # Refresh CDN list periodically
             global CDN_LIST
             CDN_LIST = new_cdn_list
 
@@ -691,70 +670,47 @@ def expiry_worker():
             ]
 
             if expired_rules:
-
                 for key in expired_rules:
                     del db[key]
-
                 save_domains(db)
                 changed = True
 
-                ip_deps = {}
-
-                # rebuild dependency map
-                for entry in db.values():
-
-                    ip = entry["ip"]
-
-                    if ip not in ip_deps:
-                        ip_deps[ip] = set()
-
-                    ip_deps[ip].update(entry["deps"])
-
-                # -----------------------------
-                # Update IP files
-                # -----------------------------
-                for ip, deps in ip_deps.items():
-
-                    path = os.path.join(LIST_DIR, f"{ip}.txt")
-
-                    with open(path, "w") as f:
-                        for d in sorted(deps):
-                            f.write(d + "\n")
-
-                # -----------------------------
-                # Clean IP files that lost rules
-                # (DO NOT delete them)
-                # -----------------------------
-                for filename in os.listdir(LIST_DIR):
-
-                    if not filename.endswith(".txt"):
-                        continue
-
-                    ip_str = filename.replace(".txt", "")
-
-                    try:
-                        ipaddress.ip_address(ip_str)
-                    except ValueError:
-                        continue
-
-                    path = os.path.join(LIST_DIR, filename)
-
-                    if ip_str not in ip_deps:
-                        # Clear file but keep it
-                        open(path, "w").close()
-
-                # -----------------------------
-                # Regenerate configs safely
-                # -----------------------------
-                regenerate_squid_configs()
+            if changed:
+                db_snapshot = dict(db)
 
         # -----------------------------
-        # Phase 2 — Reload Squid (Outside Lock)
+        # Phase 2 — Heavy I/O outside lock
         # -----------------------------
-        if changed:
+        if changed and db_snapshot is not None:
+            ip_deps = {}
+            for entry in db_snapshot.values():
+                ip = entry["ip"]
+                if ip not in ip_deps:
+                    ip_deps[ip] = set()
+                ip_deps[ip].update(entry["deps"])
+
+            for ip, deps in ip_deps.items():
+                path = os.path.join(LIST_DIR, f"{ip}.txt")
+                with open(path, "w") as f:
+                    for d in sorted(deps):
+                        f.write(d + "\n")
+
+            for filename in os.listdir(LIST_DIR):
+                if not filename.endswith(".txt"):
+                    continue
+                ip_str = filename.replace(".txt", "")
+                try:
+                    ipaddress.ip_address(ip_str)
+                except ValueError:
+                    continue
+                if ip_str not in ip_deps:
+                    open(os.path.join(LIST_DIR, filename), "w").close()
+
+            regenerate_squid_configs()
             reload_squid()
 
         time.sleep(60)
+
 
 # ------------------------------------------------
 # SLASH COMMANDS
@@ -796,28 +752,33 @@ def allow_cmd(ack, respond, command):
         respond(f"❌ Invalid domain: {domain}")
         return
 
-    # --- Full-net override for relay-based tools ---
-    # Domains like UltraViewer, AnyDesk, TeamViewer route through dynamically
-    # assigned relay IPs — domain whitelisting is unreliable for these.
-    # If the requested domain is in full_access_domains, automatically grant
-    # full-net access to the IP instead and skip the dependency scanner.
+    # Full-net override for relay-based tools
     domain_root = f"{tldextract.extract(domain).domain}.{tldextract.extract(domain).suffix}"
     full_access_set = load_full_access_domains()
 
     if domain_root in full_access_set or domain.lower() in full_access_set:
         safe_name = ip.replace(".", "_")
         path = os.path.join(FULLNET_DIR, f"{ip}.conf")
-        rule = f"# Full-net override for {ip} (auto: {domain} is a relay-based tool)\nacl fullnet_{safe_name} src {ip}\nhttp_access allow fullnet_{safe_name}\n"
+        rule = (
+            f"# Full-net override for {ip} (auto: {domain} is a relay-based tool)\n"
+            f"acl fullnet_{safe_name} src {ip}\n"
+            f"http_access allow fullnet_{safe_name}\n"
+        )
         with lock:
             with open(path, "w") as f:
                 f.write(rule)
-        reload_squid(respond)
+
+        # FIX: respond() BEFORE reload — Slack webhook expires in ~3s.
+        # Squid parse+reconfigure can take longer, so the message was
+        # silently dropped when respond() was called after reload.
         respond(
             f"🔓 *Full Internet Access Granted* for `{ip}`\n"
             f"• Reason: `{domain}` uses dynamic relay servers that cannot be whitelisted by domain.\n"
             f"• Effect: all outbound traffic from `{ip}` is now permitted.\n"
-            f"• Use `/lock-net {ip}` to revoke when the session is done."
+            f"• Use `/lock-net {ip}` to revoke when the session is done.\n"
+            f"⚙️ Reloading Squid..."
         )
+        reload_squid(channel=command.get("channel_id"))
         audit_log(
             action="ALLOW→FULL-NET",
             user_id=command["user_id"],
@@ -831,32 +792,42 @@ def allow_cmd(ack, respond, command):
         )
         return
 
-    respond(f"⚙️ Processing {domain} for {ip}...")
-
+    respond(f"⚙️ Processing `{domain}` for `{ip}`...")
 
     deps = discover(domain, respond)
     base = classify(domain)
-    if base: deps.add(base)
+    if base:
+        deps.add(base)
 
     with lock:
         db = load_domains()
         db[f"{ip}:{domain}"] = {
-            "ip": ip, "domain": domain, "deps": list(deps), "expires": expiry_timestamp
+            "ip": ip,
+            "domain": domain,
+            "deps": list(deps),
+            "expires": expiry_timestamp
         }
         save_domains(db)
 
-        path = os.path.join(LIST_DIR, f"{ip}.txt")
-        current = set()
-        if os.path.exists(path):
-            with open(path, 'r') as f: current = set(line.strip() for line in f if line.strip())
-        
-        updated = current | deps
-        with open(path, 'w') as f:
-            for d in sorted(updated): f.write(d + "\n")
-        
-        regenerate_squid_configs()
-    
-    reload_squid(respond)
+        # FIX: rebuild IP file purely from domains.json instead of merging
+        # with the existing file via `current | deps`. The old approach caused
+        # domains from previous /allow calls to accumulate indefinitely even
+        # after they were removed via /deny or expiry.
+        rebuild_ip_file(ip, db)
+
+    regenerate_squid_configs()
+
+    # FIX: respond() BEFORE reload — Slack webhook expires in ~3s.
+    respond(
+        f"✅ *Access granted*\n"
+        f"• IP: `{ip}`\n"
+        f"• Domain: `{domain}`\n"
+        f"• Dependencies: `{len(deps)}`\n"
+        f"• Expiry: {time_text}\n"
+        f"⚙️ Reloading Squid..."
+    )
+    reload_squid(channel=command.get("channel_id"))
+
     audit_log(
         action="ALLOW",
         user_id=command["user_id"],
@@ -869,15 +840,14 @@ def allow_cmd(ack, respond, command):
         )
     )
 
+
 # ------------------------------------------------
 # DENY
 # ------------------------------------------------
 
 @app.command("/deny")
 def deny_cmd(ack, respond, command):
-
     ack()
-
     args = command["text"].split()
 
     if len(args) != 2:
@@ -892,11 +862,7 @@ def deny_cmd(ack, respond, command):
 
     domain = normalize(domain)
     key = f"{ip}:{domain}"
-
-    # Collect outcome inside the lock — respond() is an HTTP call and must
-    # never be made while holding the lock (would block the expiry worker).
     not_found = False
-    remaining_deps = set()
 
     with lock:
         db = load_domains()
@@ -905,28 +871,20 @@ def deny_cmd(ack, respond, command):
         else:
             del db[key]
             save_domains(db)
-            for entry in db.values():
-                if entry["ip"] == ip:
-                    remaining_deps.update(entry["deps"])
-
-            # --- Rewrite IP ACL file ---
-            list_path = os.path.join(LIST_DIR, f"{ip}.txt")
-            with open(list_path, "w") as f:
-                for d in sorted(remaining_deps):
-                    f.write(d + "\n")
-
-            # If no domains remain, file will simply be empty
-            # (CRITICAL: file is never deleted)
-
-            regenerate_squid_configs()
+            # FIX: use rebuild_ip_file (db-driven) so the file stays in sync
+            # with domains.json. Consistent with allow_cmd and expiry_worker.
+            rebuild_ip_file(ip, db)
 
     if not_found:
         respond(f"⚠️ `{domain}` not found for `{ip}`")
         return
 
-    reload_squid(respond)
+    regenerate_squid_configs()
 
-    respond(f"🚫 `{domain}` removed from `{ip}`")
+    # FIX: respond() BEFORE reload — Slack webhook expires in ~3s.
+    respond(f"🚫 `{domain}` removed from `{ip}`. ⚙️ Reloading Squid...")
+    reload_squid(channel=command.get("channel_id"))
+
     audit_log(
         action="DENY",
         user_id=command["user_id"],
@@ -938,15 +896,13 @@ def deny_cmd(ack, respond, command):
     )
 
 
-
-#-----------------------------------
-# COMMAND: EXTEND
-# -----------------------------------    
+# ------------------------------------------------
+# EXTEND
+# ------------------------------------------------
 
 @app.command("/extend")
 def extend_cmd(ack, respond, command):
     ack()
-
     args = command["text"].split()
 
     if len(args) != 3:
@@ -970,11 +926,7 @@ def extend_cmd(ack, respond, command):
         return
 
     extra_seconds = hours * 3600
-
     key = f"{ip}:{domain}"
-
-    # Use a result code so all respond() calls happen OUTSIDE the lock.
-    # respond() is an HTTP call — holding the lock during it blocks everything.
     result = None
 
     with lock:
@@ -1004,6 +956,7 @@ def extend_cmd(ack, respond, command):
             status="⚠️ Not Found"
         )
         return
+
     if result == "no_expiry":
         respond(f"⚠️ `{domain}` for `{ip}` has no expiry to extend.")
         audit_log(
@@ -1017,9 +970,9 @@ def extend_cmd(ack, respond, command):
 
     respond(
         f"⏱️ *Extended access*\n"
-        f"IP: `{ip}`\n"
-        f"Domain: `{domain}`\n"
-        f"Added: `{hours}h`"
+        f"• IP: `{ip}`\n"
+        f"• Domain: `{domain}`\n"
+        f"• Added: `{hours}h`"
     )
     audit_log(
         action="EXTEND",
@@ -1032,23 +985,31 @@ def extend_cmd(ack, respond, command):
         )
     )
 
+
 # ------------------------------------------------
-# COMMAND: FULL NET
+# FULL NET
 # ------------------------------------------------
+
 @app.command("/full-net")
 def fullnet_cmd(ack, respond, command):
     ack()
     ip = command["text"].strip()
     if not validate_ip(ip):
-        respond("Invalid IP")
+        respond("❌ Invalid IP")
         return
     safe_name = ip.replace(".", "_")
     path = os.path.join(FULLNET_DIR, f"{ip}.conf")
-    rule = f"# Override for {ip}\nacl fullnet_{safe_name} src {ip}\nhttp_access allow fullnet_{safe_name}\n"
+    rule = (
+        f"# Override for {ip}\n"
+        f"acl fullnet_{safe_name} src {ip}\n"
+        f"http_access allow fullnet_{safe_name}\n"
+    )
     with lock:
-        with open(path, "w") as f: f.write(rule)
-    reload_squid(respond)
-    respond(f"🔓 *Full Internet Enabled* for {ip}")
+        with open(path, "w") as f:
+            f.write(rule)
+    # FIX: respond() BEFORE reload — Slack webhook expires in ~3s.
+    respond(f"🔓 *Full Internet Enabled* for `{ip}`. ⚙️ Reloading Squid...")
+    reload_squid(channel=command.get("channel_id"))
     audit_log(
         action="FULL-NET",
         user_id=command["user_id"],
@@ -1057,9 +1018,11 @@ def fullnet_cmd(ack, respond, command):
         status="🔓 Enabled"
     )
 
+
 # ------------------------------------------------
-# COMMAND: LOCK NET
+# LOCK NET
 # ------------------------------------------------
+
 @app.command("/lock-net")
 def locknet_cmd(ack, respond, command):
     ack()
@@ -1075,10 +1038,11 @@ def locknet_cmd(ack, respond, command):
                 f.write("# Disabled by /lock-net command\n")
             did_disable = True
     # reload_squid() called OUTSIDE lock — it acquires the same lock
-    # internally and would deadlock if called from within the with lock: block.
+    # internally and would deadlock if called from within the with block.
     if did_disable:
-        reload_squid(respond)
-        respond(f"🔒 *Restrictions Restored* for `{ip}`")
+        # FIX: respond() BEFORE reload — Slack webhook expires in ~3s.
+        respond(f"🔒 *Restrictions Restored* for `{ip}`. ⚙️ Reloading Squid...")
+        reload_squid(channel=command.get("channel_id"))
         audit_log(
             action="LOCK-NET",
             user_id=command["user_id"],
@@ -1089,9 +1053,11 @@ def locknet_cmd(ack, respond, command):
     else:
         respond(f"⚠️ No full-net override found for `{ip}`")
 
+
 # ------------------------------------------------
-# COMMAND: LIST
+# LIST
 # ------------------------------------------------
+
 @app.command("/list")
 def list_cmd(ack, respond, command):
     ack()
@@ -1133,6 +1099,7 @@ def list_cmd(ack, respond, command):
     if len(response_text) > 3800:
         response_text = response_text[:3800] + "\n… *(truncated — too many entries)*"
     respond(response_text)
+
 
 # ------------------------------------------------
 # SQUID MONITOR WORKER
@@ -1187,23 +1154,17 @@ def squid_monitor_worker():
 
         time.sleep(30)
 
+
 # ------------------------------------------------
 # STARTUP
 # ------------------------------------------------
-if __name__ == "__main__":
 
+if __name__ == "__main__":
     regenerate_squid_configs()
     reload_squid()
 
-    threading.Thread(
-        target=expiry_worker,
-        daemon=True
-    ).start()
-
-    threading.Thread(
-        target=squid_monitor_worker,
-        daemon=True
-    ).start()
+    threading.Thread(target=expiry_worker, daemon=True).start()
+    threading.Thread(target=squid_monitor_worker, daemon=True).start()
 
     handler = SocketModeHandler(app, SLACK_APP_TOKEN)
     print("🚀 Slack Squid Bot is active and monitoring...")
