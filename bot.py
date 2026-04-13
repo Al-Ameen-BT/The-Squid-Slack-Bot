@@ -11,6 +11,14 @@ import shutil
 from urllib.parse import urlparse
 from datetime import datetime, timedelta, timezone
 
+# Load .env file (for running directly with `python3 bot.py`).
+# When deployed via systemd, EnvironmentFile= handles this instead.
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass  # dotenv not installed — rely on environment variables being pre-set
+
 
 from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
