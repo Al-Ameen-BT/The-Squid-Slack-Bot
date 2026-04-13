@@ -5,9 +5,9 @@ Wants=squid.service
 
 [Service]
 Type=simple
-# Run as root: the VM-level no_new_privs flag blocks sudo from escalating
-# privileges, making it impossible to reload Squid as a non-root user.
-# Filesystem access is still restricted by ProtectSystem and ReadWritePaths.
+# Runs as root — required because the VM enforces a kernel-level no_new_privs
+# flag that permanently blocks sudo (setuid escalation). Root access is scoped
+# down by ProtectSystem=strict and ReadWritePaths below.
 User=root
 WorkingDirectory=/opt/The-Squid-Slack-Bot
 EnvironmentFile=/opt/The-Squid-Slack-Bot/.env
@@ -18,15 +18,13 @@ StandardOutput=journal
 StandardError=journal
 
 # Security hardening
-# NOTE: NoNewPrivileges is intentionally NOT set — the bot must call
-# `sudo squid -k reconfigure` which requires sudo's setuid bit to work.
-# Privilege scope is restricted via /etc/sudoers.d/slack-squid-bot instead.
 ProtectSystem=strict
 ProtectHome=yes
-ReadWritePaths=/etc/squid /etc/squid/lists /etc/squid/conf.d
+PrivateTmp=true
+ReadWritePaths=/etc/squid
 
 # Resource limits
-MemoryLimit=512M
+MemoryMax=512M
 CPUQuota=50%
 
 [Install]
