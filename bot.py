@@ -471,7 +471,7 @@ def discover(domain, respond):
     - Captures iframes and web workers
     """
     discovered = set()
-    respond("🔎 Launching dependency scanner...")
+    respond("🔎 Searching...")
 
     # Pages to scan beyond root
     EXTRA_PATHS = ["/login", "/signin", "/app", "/dashboard", "/api"]
@@ -498,14 +498,11 @@ def discover(domain, respond):
                 category_domains = {e.lower().strip() for e in entries}
                 if requested_root in category_domains or domain.lower() in category_domains:
                     effective_blocklist -= category_domains
-                    respond(
-                        f"ℹ️ Explicit request detected: scanning all of `{domain}`'s "
-                        f"own CDNs and dependencies (bypassing `{category}` filter for this scan)"
-                    )
+                    
                     log.info(f"discover: lifted '{category}' blocklist for explicit request of {domain}")
                     break
         except Exception as e:
-            log.warning(f"discover: could not compute category override for {domain}: {e}")
+            log.warning(f"Error: Finding {domain}: {e}")
 
 
     def capture_requests(page):
@@ -824,7 +821,7 @@ def allow_cmd(ack, respond, command):
         with lock:
             with open(path, "w") as f:
                 f.write(rule)
-        reload_squid()
+        reload_squid(respond)
         respond(
             f"🔓 *Full Internet Access Granted* for `{ip}`\n"
             f"• Reason: `{domain}` uses dynamic relay servers that cannot be whitelisted by domain.\n"
@@ -868,8 +865,7 @@ def allow_cmd(ack, respond, command):
             for d in sorted(updated): f.write(d + "\n")
         
     regenerate_squid_configs()
-    reload_squid()
-    respond(f"✅ *Allowed:* {domain} is now accessible for {ip} {time_text}")
+    reload_squid(respond)
     audit_log(
         action="ALLOW",
         user_id=command["user_id"],
@@ -939,7 +935,7 @@ def deny_cmd(ack, respond, command):
 
     regenerate_squid_configs()
 
-    reload_squid()
+    reload_squid(respond)
 
     respond(f"🚫 `{domain}` removed from `{ip}`")
     audit_log(
@@ -1062,7 +1058,7 @@ def fullnet_cmd(ack, respond, command):
     rule = f"# Override for {ip}\nacl fullnet_{safe_name} src {ip}\nhttp_access allow fullnet_{safe_name}\n"
     with lock:
         with open(path, "w") as f: f.write(rule)
-    reload_squid()
+    reload_squid(respond)
     respond(f"🔓 *Full Internet Enabled* for {ip}")
     audit_log(
         action="FULL-NET",
@@ -1092,7 +1088,7 @@ def locknet_cmd(ack, respond, command):
     # reload_squid() called OUTSIDE lock — it acquires the same lock
     # internally and would deadlock if called from within the with lock: block.
     if did_disable:
-        reload_squid()
+        reload_squid(respond)
         respond(f"🔒 *Restrictions Restored* for `{ip}`")
         audit_log(
             action="LOCK-NET",
