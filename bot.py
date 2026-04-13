@@ -377,7 +377,8 @@ def reload_squid(respond=None):
         if now - last_reload < 5:
             return
 
-        test = subprocess.run(["sudo", "squid", "-k", "parse"], capture_output=True)
+        # Run as root — call squid directly, no sudo needed
+        test = subprocess.run(["/usr/sbin/squid", "-k", "parse"], capture_output=True)
         if test.returncode != 0:
             msg = f"Squid config parse error: {test.stderr.decode().strip()}"
             log.error(msg)
@@ -385,7 +386,7 @@ def reload_squid(respond=None):
                 respond(f"❌ Squid config error:\n{test.stderr.decode()}")
             return
 
-        result = subprocess.run(["sudo", "squid", "-k", "reconfigure"], capture_output=True)
+        result = subprocess.run(["/usr/sbin/squid", "-k", "reconfigure"], capture_output=True)
         last_reload = now
 
         if result.returncode == 0:

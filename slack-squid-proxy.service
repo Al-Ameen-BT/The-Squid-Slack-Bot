@@ -5,7 +5,10 @@ Wants=squid.service
 
 [Service]
 Type=simple
-User=squid
+# Run as root: the VM-level no_new_privs flag blocks sudo from escalating
+# privileges, making it impossible to reload Squid as a non-root user.
+# Filesystem access is still restricted by ProtectSystem and ReadWritePaths.
+User=root
 WorkingDirectory=/opt/The-Squid-Slack-Bot
 EnvironmentFile=/opt/The-Squid-Slack-Bot/.env
 ExecStart=/usr/bin/python3 /opt/The-Squid-Slack-Bot/bot.py
