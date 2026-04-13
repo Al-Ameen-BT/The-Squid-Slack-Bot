@@ -453,22 +453,51 @@ def discover(domain, respond):
     # Load filter config fresh on every scan — no restart needed after edits
     social_ad_blocklist, functional_resource_types = load_filter_config()
 
+    # --- Explicit domain override ---
+    # If the requested domain is itself in the blocklist (e.g. youtube.com),
+    # temporarily lift that entire blocklist category for THIS scan only.
+    # This lets the domain's own CDNs (googlevideo.com, ytimg.com, etc.)
+    # be discovered as dependencies instead of being silently blocked.
+    # All other categories (analytics, ads, CRM) still apply normally.
+    effective_blocklist = set(social_ad_blocklist)
+    requested_root = f"{tldextract.extract(domain).domain}.{tldextract.extract(domain).suffix}"
+
+    if requested_root in effective_blocklist or domain.lower() in effective_blocklist:
+        try:
+            with open(FILTER_CONFIG_FILE, "r") as f:
+                cfg = json.load(f)
+            for category, entries in cfg.get("blocklist", {}).items():
+                if category == "_comment" or not isinstance(entries, list):
+                    continue
+                category_domains = {e.lower().strip() for e in entries}
+                if requested_root in category_domains or domain.lower() in category_domains:
+                    effective_blocklist -= category_domains
+                    respond(
+                        f"ℹ️ Explicit request detected: scanning all of `{domain}`'s "
+                        f"own CDNs and dependencies (bypassing `{category}` filter for this scan)"
+                    )
+                    log.info(f"discover: lifted '{category}' blocklist for explicit request of {domain}")
+                    break
+        except Exception as e:
+            log.warning(f"discover: could not compute category override for {domain}: {e}")
+
+
     def capture_requests(page):
         """Attach request interceptor to a page."""
 
         def is_noise(host: str) -> bool:
             """
             Returns True if this host should be excluded from discovered deps.
-            Checks:
-              1. Direct match against blocklist
-              2. tldextract root domain match (catches all subdomains)
+            Uses effective_blocklist which may have the requested domain's
+            own category lifted when the domain was explicitly requested.
             """
             host = host.lower().lstrip(".")
-            if host in social_ad_blocklist:
+            if host in effective_blocklist:
                 return True
             ext = tldextract.extract(host)
             root = f"{ext.domain}.{ext.suffix}"
-            return root in social_ad_blocklist
+            return root in effective_blocklist
+
 
         def on_request(req):
             try:
