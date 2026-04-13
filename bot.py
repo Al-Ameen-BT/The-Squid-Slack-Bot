@@ -656,7 +656,7 @@ def discover(domain, respond):
             if browser:
                 browser.close()
 
-    respond(f"✅ Scan complete — {len(discovered)} dependencies found")
+    respond(f"✅ {len(discovered)} dependencies found")
     return discovered
 
 # ------------------------------------------------
