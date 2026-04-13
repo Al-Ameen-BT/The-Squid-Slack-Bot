@@ -581,7 +581,7 @@ def discover(domain, respond):
         try:
             browser = p.chromium.launch(
                 headless=True,
-                args=["--disable-dev-shm-usage"]
+                args=["--disable-dev-shm-usage", "--no-sandbox"]
             )
             context = browser.new_context(
                 user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
@@ -670,12 +670,11 @@ def expiry_worker():
     while True:
 
         changed = False
-        db_snapshot = None
 
         new_cdn_list = get_cdn_domains()
 
         # -----------------------------
-        # Phase 1 — Minimal Lock Scope
+        # Phase 1 — Update DB & Regenerate Files (Under Lock)
         # -----------------------------
         with lock:
 
@@ -699,64 +698,60 @@ def expiry_worker():
                 save_domains(db)
                 changed = True
 
-            if changed:
-                db_snapshot = dict(db)
+                ip_deps = {}
+
+                # rebuild dependency map
+                for entry in db.values():
+
+                    ip = entry["ip"]
+
+                    if ip not in ip_deps:
+                        ip_deps[ip] = set()
+
+                    ip_deps[ip].update(entry["deps"])
+
+                # -----------------------------
+                # Update IP files
+                # -----------------------------
+                for ip, deps in ip_deps.items():
+
+                    path = os.path.join(LIST_DIR, f"{ip}.txt")
+
+                    with open(path, "w") as f:
+                        for d in sorted(deps):
+                            f.write(d + "\n")
+
+                # -----------------------------
+                # Clean IP files that lost rules
+                # (DO NOT delete them)
+                # -----------------------------
+                for filename in os.listdir(LIST_DIR):
+
+                    if not filename.endswith(".txt"):
+                        continue
+
+                    ip_str = filename.replace(".txt", "")
+
+                    try:
+                        ipaddress.ip_address(ip_str)
+                    except ValueError:
+                        continue
+
+                    path = os.path.join(LIST_DIR, filename)
+
+                    if ip_str not in ip_deps:
+                        # Clear file but keep it
+                        open(path, "w").close()
+
+                # -----------------------------
+                # Regenerate configs safely
+                # -----------------------------
+                regenerate_squid_configs()
 
         # -----------------------------
-        # Phase 2 — Heavy I/O Outside Lock
+        # Phase 2 — Reload Squid (Outside Lock)
         # -----------------------------
-        if changed and db_snapshot is not None:
-
-            ip_deps = {}
-
-            # rebuild dependency map
-            for entry in db_snapshot.values():
-
-                ip = entry["ip"]
-
-                if ip not in ip_deps:
-                    ip_deps[ip] = set()
-
-                ip_deps[ip].update(entry["deps"])
-
-            # -----------------------------
-            # Update IP files
-            # -----------------------------
-            for ip, deps in ip_deps.items():
-
-                path = os.path.join(LIST_DIR, f"{ip}.txt")
-
-                with open(path, "w") as f:
-                    for d in sorted(deps):
-                        f.write(d + "\n")
-
-            # -----------------------------
-            # Clean IP files that lost rules
-            # (DO NOT delete them)
-            # -----------------------------
-            for filename in os.listdir(LIST_DIR):
-
-                if not filename.endswith(".txt"):
-                    continue
-
-                ip_str = filename.replace(".txt", "")
-
-                try:
-                    ipaddress.ip_address(ip_str)
-                except ValueError:
-                    continue
-
-                path = os.path.join(LIST_DIR, filename)
-
-                if ip_str not in ip_deps:
-                    # Clear file but keep it
-                    open(path, "w").close()
-
-            # -----------------------------
-            # Regenerate configs safely
-            # -----------------------------
-            regenerate_squid_configs()
-
+        if changed:
             reload_squid()
 
         time.sleep(60)
@@ -859,7 +854,8 @@ def allow_cmd(ack, respond, command):
         with open(path, 'w') as f:
             for d in sorted(updated): f.write(d + "\n")
         
-    regenerate_squid_configs()
+        regenerate_squid_configs()
+    
     reload_squid(respond)
     audit_log(
         action="ALLOW",
@@ -913,22 +909,20 @@ def deny_cmd(ack, respond, command):
                 if entry["ip"] == ip:
                     remaining_deps.update(entry["deps"])
 
+            # --- Rewrite IP ACL file ---
+            list_path = os.path.join(LIST_DIR, f"{ip}.txt")
+            with open(list_path, "w") as f:
+                for d in sorted(remaining_deps):
+                    f.write(d + "\n")
+
+            # If no domains remain, file will simply be empty
+            # (CRITICAL: file is never deleted)
+
+            regenerate_squid_configs()
+
     if not_found:
         respond(f"⚠️ `{domain}` not found for `{ip}`")
         return
-
-    # --- Rewrite IP ACL file (outside lock) ---
-
-    list_path = os.path.join(LIST_DIR, f"{ip}.txt")
-
-    with open(list_path, "w") as f:
-        for d in sorted(remaining_deps):
-            f.write(d + "\n")
-
-    # If no domains remain, file will simply be empty
-    # (CRITICAL: file is never deleted)
-
-    regenerate_squid_configs()
 
     reload_squid(respond)
 
