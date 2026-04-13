@@ -44,25 +44,12 @@ playwright install-deps
 
 ## 3. Permissions Setup
 
-When running via systemd, the bot runs under the core designated proxy user `squid`. This requires sudo permission to hot-reload the Squid service.
+The bot runs as **root** under systemd. This is required because the VM enforces a kernel-level `no_new_privs` flag that permanently blocks `sudo` (which relies on the `setuid` bit to escalate privileges). Running as root avoids the escalation entirely.
 
-Create a sudoers file to whitelist these strict commands:
-```bash
-sudo visudo -f /etc/sudoers.d/slack-squid-bot
-```
-Add the following line exactly:
-```
-squid ALL=(ALL) NOPASSWD: /usr/sbin/squid -k parse, /usr/sbin/squid -k reconfigure
-```
+> **Security note:** Root access is scoped down by the systemd unit's `ProtectSystem=strict` and `ReadWritePaths` directives, which prevent the bot from writing anywhere outside of `/etc/squid`. No additional sudoers configuration or `chown` is needed.
 
-*Note: Depending on your Linux distribution, the Squid binary may be at `/usr/sbin/squid`. Verify whereabouts via `which squid`.*
+No further permission setup is required. Skip to Section 4.
 
-Ensure the `squid` user owns both the ACL folders **and** the application directory it reads at startup:
-```bash
-sudo chown -R squid:squid /etc/squid/conf.d/
-sudo chown -R squid:squid /etc/squid/lists/
-sudo chown -R squid:squid /opt/The-Squid-Slack-Bot/
-```
 
 ## 4. Systemd Scheduling
 
