@@ -481,8 +481,6 @@ def discover(domain, respond):
     discovered = set()
     respond("🔎 Searching...")
 
-    EXTRA_PATHS = ["/login", "/signin", "/app", "/dashboard", "/api"]
-
     # Load filter config fresh on every scan — no restart needed after edits
     social_ad_blocklist, functional_resource_types = load_filter_config()
 
@@ -602,33 +600,6 @@ def discover(domain, respond):
                 respond(f"⚠️ Root scan warning: {e}")
             finally:
                 page.close()
-
-            # Page 2+: Common subpages
-            for path in EXTRA_PATHS:
-                url = f"https://{domain}{path}"
-                sub_page = None
-                try:
-                    sub_page = context.new_page()
-                    capture_requests(sub_page)
-                    sub_resp = sub_page.goto(
-                        url,
-                        timeout=15000,
-                        wait_until="domcontentloaded"
-                    )
-                    if sub_resp and sub_resp.status < 400:
-                        respond(f"📄 Scanning: {url}")
-                        interact_page(sub_page)
-                except Exception:
-                    pass
-                finally:
-                    # FIX: always close sub_page even if an exception occurred
-                    # mid-scan. Previously the nested try/except could silently
-                    # swallow errors and leak open browser pages.
-                    if sub_page:
-                        try:
-                            sub_page.close()
-                        except Exception:
-                            pass
 
         except Exception as e:
             respond(f"⚠️ Scanner error: {str(e)}")
