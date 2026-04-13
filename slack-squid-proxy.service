@@ -6,9 +6,9 @@ Wants=squid.service
 [Service]
 Type=simple
 User=squid
-WorkingDirectory=/opt/slack-squid-proxy
-EnvironmentFile=/opt/slack-squid-proxy/.env
-ExecStart=/usr/bin/python3 /opt/slack-squid-proxy/bot.py
+WorkingDirectory=/opt/The-Squid-Slack-Bot
+EnvironmentFile=/opt/The-Squid-Slack-Bot/.env
+ExecStart=/usr/bin/python3 /opt/The-Squid-Slack-Bot/bot.py
 Restart=on-failure
 RestartSec=10
 StandardOutput=journal
@@ -18,7 +18,7 @@ StandardError=journal
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=yes
-ReadWritePaths=/etc/squid/lists /etc/squid/conf.d
+ReadWritePaths=/etc/squid /etc/squid/lists /etc/squid/conf.d
 
 # Resource limits
 MemoryLimit=512M
