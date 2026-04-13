@@ -5,9 +5,6 @@ Wants=squid.service
 
 [Service]
 Type=simple
-# Runs as root — required because the VM enforces a kernel-level no_new_privs
-# flag that permanently blocks sudo (setuid escalation). Root access is scoped
-# down by ProtectSystem=strict and ReadWritePaths below.
 User=root
 WorkingDirectory=/opt/The-Squid-Slack-Bot
 EnvironmentFile=/opt/The-Squid-Slack-Bot/.env
@@ -16,12 +13,6 @@ Restart=on-failure
 RestartSec=10
 StandardOutput=journal
 StandardError=journal
-
-# Security hardening
-ProtectSystem=strict
-ProtectHome=yes
-PrivateTmp=true
-ReadWritePaths=/etc/squid
 
 # Resource limits
 MemoryMax=512M
