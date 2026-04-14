@@ -34,6 +34,8 @@ SLACK_LOG_CHANNEL = os.environ.get("SLACK_LOG_CHANNEL")
 LIST_DIR = "/etc/squid/lists"
 DOMAINS_FILE = "/etc/squid/domains.json"
 FULLNET_DIR = "/etc/squid/conf.d/fullnet"
+OVERRIDE_DIR = "/etc/squid/conf.d/override"
+ULTRAVIEWER_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ultraviewer.txt")
 CDN_DOMAINS_FILE = "/etc/squid/cdn_domains.txt"
 DOMAIN_CONF = "/etc/squid/conf.d/02-domain-lists.conf"
 HOSTS_CONF = "/etc/squid/conf.d/01-hosts.conf"
@@ -42,6 +44,7 @@ RULES_CONF = "/etc/squid/conf.d/03-rules.conf"
 
 # STARTUP GUARD
 os.makedirs(FULLNET_DIR, exist_ok=True)
+os.makedirs(OVERRIDE_DIR, exist_ok=True)
 os.makedirs(LIST_DIR, exist_ok=True)
 os.makedirs(f"{LIST_DIR}/groups", exist_ok=True)
 
@@ -303,6 +306,34 @@ def regenerate_squid_configs():
 
     with open(RULES_CONF, "w") as f:
         f.write("\n".join(rule_lines) + "\n")
+
+def rebuild_override_configs():
+    """
+    Rebuilds /etc/squid/conf.d/override/ultraviewer.conf based on active db entries.
+    Called outside lock.
+    """
+    os.makedirs(OVERRIDE_DIR, exist_ok=True)
+    conf_path = os.path.join(OVERRIDE_DIR, "ultraviewer.conf")
+    
+    db = load_domains()
+    uv_ips = set()
+    for entry in db.values():
+        if "ultraviewer" in entry["domain"].lower():
+            uv_ips.add(entry["ip"])
+            
+    if not uv_ips:
+        if os.path.exists(conf_path):
+            os.remove(conf_path)
+    else:
+        ip_list_str = " ".join(uv_ips)
+        rule = (
+            f"# Auto Generated UltraViewer Override\n"
+            f"acl uv_src src {ip_list_str}\n"
+            f"acl uv_dst dstdomain \"{ULTRAVIEWER_FILE}\"\n"
+            f"http_access allow uv_src uv_dst\n"
+        )
+        with open(conf_path, "w") as f:
+            f.write(rule)
 
 
 # ------------------------------------------------
@@ -642,6 +673,14 @@ def expiry_worker():
 
             if expired_rules:
                 for key in expired_rules:
+                    entry = db[key]
+                    audit_log(
+                        action="EXPIRED",
+                        user_id="SYSTEM",
+                        user_name="expiry_worker",
+                        details=f"• IP: `{entry['ip']}`\n• Domain: `{entry['domain']}` — access expired automatically",
+                        status="⏳ Expired"
+                    )
                     del db[key]
                 save_domains(db)
                 changed = True
@@ -678,6 +717,7 @@ def expiry_worker():
                     open(os.path.join(LIST_DIR, filename), "w").close()
 
             regenerate_squid_configs()
+            rebuild_override_configs()
             reload_squid()
 
         time.sleep(60)
@@ -726,8 +766,9 @@ def allow_cmd(ack, respond, command):
     # Full-net override for relay-based tools
     domain_root = f"{tldextract.extract(domain).domain}.{tldextract.extract(domain).suffix}"
     full_access_set = load_full_access_domains()
+    is_ultraviewer = "ultraviewer" in domain.lower()
 
-    if domain_root in full_access_set or domain.lower() in full_access_set:
+    if (domain_root in full_access_set or domain.lower() in full_access_set) and not is_ultraviewer:
         safe_name = ip.replace(".", "_")
         path = os.path.join(FULLNET_DIR, f"{ip}.conf")
         rule = (
@@ -763,12 +804,18 @@ def allow_cmd(ack, respond, command):
         )
         return
 
-    respond(f"⚙️ Processing `{domain}` for `{ip}`...")
-
-    deps = discover(domain, respond)
-    base = classify(domain)
-    if base:
-        deps.add(base)
+    if is_ultraviewer:
+        respond(f"⚙️ Applying `ultraviewer.txt` override rules for `{ip}`...")
+        deps = set() # Rules handled by override conf
+        base = classify(domain)
+        if base:
+            deps.add(base)
+    else:
+        respond(f"⚙️ Processing `{domain}` for `{ip}`...")
+        deps = discover(domain, respond)
+        base = classify(domain)
+        if base:
+            deps.add(base)
 
     with lock:
         db = load_domains()
@@ -787,6 +834,7 @@ def allow_cmd(ack, respond, command):
         rebuild_ip_file(ip, db)
 
     regenerate_squid_configs()
+    rebuild_override_configs()
 
     # FIX: respond() BEFORE reload — Slack webhook expires in ~3s.
     respond(
@@ -851,6 +899,7 @@ def deny_cmd(ack, respond, command):
         return
 
     regenerate_squid_configs()
+    rebuild_override_configs()
 
     # FIX: respond() BEFORE reload — Slack webhook expires in ~3s.
     respond(f"🚫 `{domain}` removed from `{ip}`. ⚙️ Reloading Squid...")
@@ -953,7 +1002,8 @@ def extend_cmd(ack, respond, command):
             f"• IP: `{ip}`\n"
             f"• Domain: `{domain}`\n"
             f"• Added: `{hours}h`"
-        )
+        ),
+        status="⏱️ Extended"
     )
 
 
@@ -1132,6 +1182,7 @@ def squid_monitor_worker():
 
 if __name__ == "__main__":
     regenerate_squid_configs()
+    rebuild_override_configs()
     reload_squid()
 
     threading.Thread(target=expiry_worker, daemon=True).start()
