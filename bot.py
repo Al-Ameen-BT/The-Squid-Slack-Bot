@@ -138,6 +138,32 @@ def load_full_access_domains():
         return set()
 
 
+
+def load_special_domains():
+    """
+    Reads the special_domains section from filter_config.json.
+    Returns a flat set of root domains that trigger the UltraViewer-style
+    handler workflow (static domain list instead of Playwright scan).
+
+    Example config entry:
+      "special_domains": { "ultraviewer": ["ultraviewer.net", "ultraviewer.com"] }
+    """
+    if not os.path.exists(FILTER_CONFIG_FILE):
+        return set()
+    try:
+        with open(FILTER_CONFIG_FILE, "r") as f:
+            cfg = json.load(f)
+        result = set()
+        for category, entries in cfg.get("special_domains", {}).items():
+            if category == "_comment" or not isinstance(entries, list):
+                continue
+            result.update(d.lower().strip() for d in entries)
+        return result
+    except Exception as e:
+        log.warning(f"load_special_domains: {e}")
+        return set()
+
+
 def get_cdn_domains():
     """Reads the CDN list from the external file."""
     if not os.path.exists(CDN_DOMAINS_FILE):
@@ -316,9 +342,13 @@ def rebuild_override_configs():
     conf_path = os.path.join(OVERRIDE_DIR, "ultraviewer.conf")
     
     db = load_domains()
+    special = load_special_domains()  # config-driven: reads special_domains from filter_config.json
     uv_ips = set()
     for entry in db.values():
-        if "ultraviewer" in entry["domain"].lower():
+        d = entry["domain"].lower()
+        ext = tldextract.extract(d)
+        root = f"{ext.domain}.{ext.suffix}" if ext.domain and ext.suffix else d
+        if root in special:
             uv_ips.add(entry["ip"])
             
     if not uv_ips:
@@ -753,6 +783,7 @@ def allow_cmd(ack, respond, command):
             respond("❌ Error: Time must be like `1h`, `1.5h`, or `24h`.")
             return
 
+    # Validate
     if not validate_ip(ip):
         respond(f"❌ Invalid IP: {ip}")
         return
@@ -763,50 +794,16 @@ def allow_cmd(ack, respond, command):
         respond(f"❌ Invalid domain: {domain}")
         return
 
-    # Full-net override for relay-based tools
-    domain_root = f"{tldextract.extract(domain).domain}.{tldextract.extract(domain).suffix}"
-    full_access_set = load_full_access_domains()
-    is_ultraviewer = "ultraviewer" in domain.lower()
+    # Extract required base info
+    ext = tldextract.extract(domain)
+    root_domain = f"{ext.domain}.{ext.suffix}"
+    ULTRAVIEWER_DOMAINS = load_special_domains()
+    is_ultraviewer = root_domain in ULTRAVIEWER_DOMAINS
 
-    if (domain_root in full_access_set or domain.lower() in full_access_set) and not is_ultraviewer:
-        safe_name = ip.replace(".", "_")
-        path = os.path.join(FULLNET_DIR, f"{ip}.conf")
-        rule = (
-            f"# Full-net override for {ip} (auto: {domain} is a relay-based tool)\n"
-            f"acl fullnet_{safe_name} src {ip}\n"
-            f"http_access allow fullnet_{safe_name}\n"
-        )
-        with lock:
-            with open(path, "w") as f:
-                f.write(rule)
-
-        # FIX: respond() BEFORE reload — Slack webhook expires in ~3s.
-        # Squid parse+reconfigure can take longer, so the message was
-        # silently dropped when respond() was called after reload.
-        respond(
-            f"🔓 *Full Internet Access Granted* for `{ip}`\n"
-            f"• Reason: `{domain}` uses dynamic relay servers that cannot be whitelisted by domain.\n"
-            f"• Effect: all outbound traffic from `{ip}` is now permitted.\n"
-            f"• Use `/lock-net {ip}` to revoke when the session is done.\n"
-            f"⚙️ Reloading Squid..."
-        )
-        reload_squid(channel=command.get("channel_id"))
-        audit_log(
-            action="ALLOW→FULL-NET",
-            user_id=command["user_id"],
-            user_name=command["user_name"],
-            details=(
-                f"• IP: `{ip}`\n"
-                f"• Requested: `{domain}` (relay-based tool — auto-upgraded to full-net)\n"
-                f"• Full internet access granted"
-            ),
-            status="🔓 Auto Full-Net"
-        )
-        return
-
+    # Processing
     if is_ultraviewer:
-        respond(f"⚙️ Applying `ultraviewer.txt` override rules for `{ip}`...")
-        deps = set() # Rules handled by override conf
+        respond(f"⚙️ Applying UltraViewer override for `{ip}`...")
+        deps = set()
         base = classify(domain)
         if base:
             deps.add(base)
@@ -817,6 +814,7 @@ def allow_cmd(ack, respond, command):
         if base:
             deps.add(base)
 
+    # Persist
     with lock:
         db = load_domains()
         db[f"{ip}:{domain}"] = {
@@ -826,17 +824,12 @@ def allow_cmd(ack, respond, command):
             "expires": expiry_timestamp
         }
         save_domains(db)
-
-        # FIX: rebuild IP file purely from domains.json instead of merging
-        # with the existing file via `current | deps`. The old approach caused
-        # domains from previous /allow calls to accumulate indefinitely even
-        # after they were removed via /deny or expiry.
         rebuild_ip_file(ip, db)
 
+    # Config + reload
     regenerate_squid_configs()
     rebuild_override_configs()
 
-    # FIX: respond() BEFORE reload — Slack webhook expires in ~3s.
     respond(
         f"✅ *Access granted*\n"
         f"• IP: `{ip}`\n"
@@ -845,6 +838,7 @@ def allow_cmd(ack, respond, command):
         f"• Expiry: {time_text}\n"
         f"⚙️ Reloading Squid..."
     )
+
     reload_squid(channel=command.get("channel_id"))
 
     audit_log(
