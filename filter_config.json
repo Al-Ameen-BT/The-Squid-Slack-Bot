@@ -9,6 +9,13 @@
       "rustdesk.com"
     ]
   },
+  "special_domains": {
+    "_comment": "Domains mapped to special handler workflows instead of full-net or generic playright scans.",
+    "ultraviewer": [
+      "ultraviewer.net",
+      "ultraviewer.com"
+    ]
+  },
   "functional_resource_types": [
     "document",
     "script",

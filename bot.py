@@ -61,7 +61,6 @@ log = logging.getLogger(__name__)
 
 app = App(token=SLACK_BOT_TOKEN)
 lock = threading.Lock()
-last_reload = 0
 CDN_LIST = []
 
 # ------------------------------------------------
@@ -111,32 +110,6 @@ def load_filter_config():
     except Exception as e:
         log.error(f"Failed to load filter_config.json: {e} — using built-in defaults.")
         return defaults_blocklist, defaults_types
-
-
-def load_full_access_domains():
-    """
-    Reads the full_access_domains section from filter_config.json.
-    Returns a flat set of root domains whose /allow requests should
-    automatically trigger full-net access instead of domain whitelisting.
-
-    Used for relay-based tools (UltraViewer, AnyDesk, TeamViewer, etc.)
-    whose server IPs change dynamically and can't be reliably whitelisted.
-    """
-    if not os.path.exists(FILTER_CONFIG_FILE):
-        return set()
-    try:
-        with open(FILTER_CONFIG_FILE, "r") as f:
-            cfg = json.load(f)
-        result = set()
-        for category, entries in cfg.get("full_access_domains", {}).items():
-            if category == "_comment" or not isinstance(entries, list):
-                continue
-            result.update(d.lower().strip() for d in entries)
-        return result
-    except Exception as e:
-        log.warning(f"load_full_access_domains: {e}")
-        return set()
-
 
 
 def load_special_domains():
@@ -459,7 +432,6 @@ def reload_squid(channel=None):
     via chat_postMessage (no webhook timeout risk).
     Returns True on success, False on failure.
     """
-    global last_reload
     with lock:
         test = subprocess.run(["/usr/sbin/squid", "-k", "parse"], capture_output=True)
         parse_out = test.stdout.decode().strip()
@@ -480,7 +452,6 @@ def reload_squid(channel=None):
             log.warning(f"Squid parse warnings: {parse_err}")
 
         result = subprocess.run(["/usr/sbin/squid", "-k", "reconfigure"], capture_output=True)
-        last_reload = time.time()
         reconf_out = result.stdout.decode().strip()
         reconf_err = result.stderr.decode().strip()
 
