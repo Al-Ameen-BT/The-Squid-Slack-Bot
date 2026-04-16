@@ -226,6 +226,8 @@ def regenerate_squid_configs():
         full_path = os.path.join(LIST_DIR, f)
         if os.path.isdir(full_path):
             continue
+        if f.endswith(".dst.txt"):
+            continue
         if not f.endswith(".txt"):
             continue
         ip = f.replace(".txt", "")
@@ -253,16 +255,24 @@ def regenerate_squid_configs():
         domain_lines.append(f'acl group_{safe}_domains dstdomain "{path}"')
 
     domain_lines.append("")
-    domain_lines.append("# IP DOMAIN LISTS")
+    domain_lines.append("# PER-CLIENT IP: dstdomain + optional dst (literal destination IPs)")
 
     for file in sorted(ip_files):
         ip = file.replace(".txt", "")
         safe = ip.replace(".", "_")
-        path = os.path.join(LIST_DIR, file)
-        if not os.path.exists(path):
-            open(path, "w").close()
+        path_domains = os.path.join(LIST_DIR, file)
+        path_dst = os.path.join(LIST_DIR, f"{ip}.dst.txt")
+        if not os.path.exists(path_domains):
+            open(path_domains, "w").close()
+        has_domains = os.path.getsize(path_domains) > 0
+        has_dst = os.path.exists(path_dst) and os.path.getsize(path_dst) > 0
+        if not has_domains and not has_dst:
+            continue
         domain_lines.append(f'acl ip_{safe} src {ip}')
-        domain_lines.append(f'acl ip_{safe}_domains dstdomain "{path}"')
+        if has_domains:
+            domain_lines.append(f'acl ip_{safe}_domains dstdomain "{path_domains}"')
+        if has_dst:
+            domain_lines.append(f'acl ip_{safe}_dst dst "{path_dst}"')
 
     with open(DOMAIN_CONF, "w") as f:
         f.write("\n".join(domain_lines) + "\n")
@@ -279,7 +289,16 @@ def regenerate_squid_configs():
     for file in sorted(ip_files):
         ip = file.replace(".txt", "")
         safe = ip.replace(".", "_")
-        rule_lines.append(f"http_access allow ip_{safe} ip_{safe}_domains")
+        path_domains = os.path.join(LIST_DIR, file)
+        path_dst = os.path.join(LIST_DIR, f"{ip}.dst.txt")
+        has_domains = os.path.exists(path_domains) and os.path.getsize(path_domains) > 0
+        has_dst = os.path.exists(path_dst) and os.path.getsize(path_dst) > 0
+        if not has_domains and not has_dst:
+            continue
+        if has_domains:
+            rule_lines.append(f"http_access allow ip_{safe} ip_{safe}_domains")
+        if has_dst:
+            rule_lines.append(f"http_access allow ip_{safe} ip_{safe}_dst")
 
     rule_lines.append("")
     rule_lines.append("# GROUP RULES (ADMIN MANAGED)")
@@ -319,6 +338,8 @@ def rebuild_override_configs():
     uv_ips = set()
     for entry in db.values():
         d = entry["domain"].lower()
+        if validate_ip(d):
+            continue
         ext = tldextract.extract(d)
         root = f"{ext.domain}.{ext.suffix}" if ext.domain and ext.suffix else d
         if root in special:
@@ -354,6 +375,16 @@ def validate_ip(ip):
 def validate_domain(domain):
     ext = tldextract.extract(domain)
     return bool(ext.domain and ext.suffix)
+
+
+def is_destination_ip(raw):
+    """True if the allow/deny target is a literal destination IP (not a hostname)."""
+    return validate_ip(normalize(raw))
+
+
+def canonical_destination_ip(raw):
+    """Normalize a destination IP string for stable keys and list files."""
+    return str(ipaddress.ip_address(normalize(raw)))
 
 
 def load_domains():
@@ -396,18 +427,34 @@ def normalize(domain):
 
 def rebuild_ip_file(ip, db):
     """
-    Rewrites /etc/squid/lists/<ip>.txt based solely on current db entries.
-    File is never deleted — cleared to empty if no rules remain for this IP.
+    Rewrites Squid list files for this client IP from domains.json:
+      - <ip>.txt       — dstdomain patterns (from Playwright deps for hostname rules)
+      - <ip>.dst.txt   — literal destination IPs (Squid acl ... dst file)
+
+    Cleared to empty when no rules remain for this client.
     Must be called while holding the lock.
     """
-    all_deps = set()
+    dstdomain_lines = set()
+    dst_ips = set()
     for entry in db.values():
-        if entry["ip"] == ip:
-            all_deps.update(entry["deps"])
+        if entry["ip"] != ip:
+            continue
+        dest = entry["domain"]
+        if validate_ip(dest):
+            dst_ips.add(str(ipaddress.ip_address(dest)))
+            for d in entry.get("deps", []):
+                if validate_ip(d):
+                    dst_ips.add(str(ipaddress.ip_address(d)))
+        else:
+            dstdomain_lines.update(entry.get("deps", []))
 
-    path = os.path.join(LIST_DIR, f"{ip}.txt")
-    with open(path, "w") as f:
-        for d in sorted(all_deps):
+    path_domains = os.path.join(LIST_DIR, f"{ip}.txt")
+    path_dst = os.path.join(LIST_DIR, f"{ip}.dst.txt")
+    with open(path_domains, "w") as f:
+        for d in sorted(dstdomain_lines):
+            f.write(d + "\n")
+    with open(path_dst, "w") as f:
+        for d in sorted(dst_ips):
             f.write(d + "\n")
 
 
@@ -693,28 +740,22 @@ def expiry_worker():
         # Phase 2 — Heavy I/O outside lock
         # -----------------------------
         if changed and db_snapshot is not None:
-            ip_deps = {}
-            for entry in db_snapshot.values():
-                ip = entry["ip"]
-                if ip not in ip_deps:
-                    ip_deps[ip] = set()
-                ip_deps[ip].update(entry["deps"])
-
-            for ip, deps in ip_deps.items():
-                path = os.path.join(LIST_DIR, f"{ip}.txt")
-                with open(path, "w") as f:
-                    for d in sorted(deps):
-                        f.write(d + "\n")
+            client_ips = {e["ip"] for e in db_snapshot.values()}
+            for ip in client_ips:
+                rebuild_ip_file(ip, db_snapshot)
 
             for filename in os.listdir(LIST_DIR):
-                if not filename.endswith(".txt"):
+                if filename.endswith(".dst.txt"):
+                    base = filename[:-8]
+                elif filename.endswith(".txt"):
+                    base = filename[:-4]
+                else:
                     continue
-                ip_str = filename.replace(".txt", "")
                 try:
-                    ipaddress.ip_address(ip_str)
+                    ipaddress.ip_address(base)
                 except ValueError:
                     continue
-                if ip_str not in ip_deps:
+                if base not in client_ips:
                     open(os.path.join(LIST_DIR, filename), "w").close()
 
             regenerate_squid_configs()
@@ -733,10 +774,10 @@ def allow_cmd(ack, respond, command):
     ack()
     args = command["text"].split()
     if len(args) < 2:
-        respond("Usage: `/allow <ip> <domain> [Nh]`")
+        respond("Usage: `/allow <client_ip> <domain|destination_ip> [Nh]`")
         return
 
-    ip, domain = args[0], args[1]
+    ip, raw_target = args[0], args[1]
     expiry_timestamp = None
     time_text = "indefinitely ♾️"
 
@@ -759,31 +800,35 @@ def allow_cmd(ack, respond, command):
         respond(f"❌ Invalid IP: {ip}")
         return
 
-    domain = normalize(domain)
-
-    if not validate_domain(domain):
-        respond(f"❌ Invalid domain: {domain}")
-        return
-
-    # Extract required base info
-    ext = tldextract.extract(domain)
-    root_domain = f"{ext.domain}.{ext.suffix}"
-    ULTRAVIEWER_DOMAINS = load_special_domains()
-    is_ultraviewer = root_domain in ULTRAVIEWER_DOMAINS
-
-    # Processing
-    if is_ultraviewer:
-        respond(f"⚙️ Applying UltraViewer override for `{ip}`...")
+    if is_destination_ip(raw_target):
+        domain = canonical_destination_ip(raw_target)
         deps = set()
-        base = classify(domain)
-        if base:
-            deps.add(base)
+        respond(f"⚙️ Allowing destination IP `{domain}` for client `{ip}`...")
     else:
-        respond(f"⚙️ Processing `{domain}` for `{ip}`...")
-        deps = discover(domain, respond)
-        base = classify(domain)
-        if base:
-            deps.add(base)
+        domain = normalize(raw_target)
+        if not validate_domain(domain):
+            respond(f"❌ Invalid domain: {domain}")
+            return
+
+        # Extract required base info
+        ext = tldextract.extract(domain)
+        root_domain = f"{ext.domain}.{ext.suffix}"
+        ULTRAVIEWER_DOMAINS = load_special_domains()
+        is_ultraviewer = root_domain in ULTRAVIEWER_DOMAINS
+
+        # Processing
+        if is_ultraviewer:
+            respond(f"⚙️ Applying UltraViewer override for `{ip}`...")
+            deps = set()
+            base = classify(domain)
+            if base:
+                deps.add(base)
+        else:
+            respond(f"⚙️ Processing `{domain}` for `{ip}`...")
+            deps = discover(domain, respond)
+            base = classify(domain)
+            if base:
+                deps.add(base)
 
     # Persist
     with lock:
@@ -801,10 +846,11 @@ def allow_cmd(ack, respond, command):
     regenerate_squid_configs()
     rebuild_override_configs()
 
+    target_label = "Destination IP" if validate_ip(domain) else "Domain"
     respond(
         f"✅ *Access granted*\n"
-        f"• IP: `{ip}`\n"
-        f"• Domain: `{domain}`\n"
+        f"• Client IP: `{ip}`\n"
+        f"• {target_label}: `{domain}`\n"
         f"• Dependencies: `{len(deps)}`\n"
         f"• Expiry: {time_text}\n"
         f"⚙️ Reloading Squid..."
@@ -835,16 +881,20 @@ def deny_cmd(ack, respond, command):
     args = command["text"].split()
 
     if len(args) != 2:
-        respond("Usage: `/deny <ip> <domain>`")
+        respond("Usage: `/deny <client_ip> <domain|destination_ip>`")
         return
 
-    ip, domain = args
+    ip, raw_target = args
 
     if not validate_ip(ip):
         respond(f"❌ Invalid IP: {ip}")
         return
 
-    domain = normalize(domain)
+    domain = (
+        canonical_destination_ip(raw_target)
+        if is_destination_ip(raw_target)
+        else normalize(raw_target)
+    )
     key = f"{ip}:{domain}"
     not_found = False
 
@@ -891,16 +941,20 @@ def extend_cmd(ack, respond, command):
     args = command["text"].split()
 
     if len(args) != 3:
-        respond("Usage: `/extend <ip> <domain> <Nh>`")
+        respond("Usage: `/extend <client_ip> <domain|destination_ip> <Nh>`")
         return
 
-    ip, domain, time_str = args
+    ip, raw_target, time_str = args
 
     if not validate_ip(ip):
         respond(f"❌ Invalid IP: {ip}")
         return
 
-    domain = normalize(domain)
+    domain = (
+        canonical_destination_ip(raw_target)
+        if is_destination_ip(raw_target)
+        else normalize(raw_target)
+    )
 
     try:
         hours = float(time_str[:-1])
