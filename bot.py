@@ -595,24 +595,43 @@ def jira_get_transitions(issue_key: str) -> dict:
 
 def jira_transition_ticket(issue_key: str, target_status: str):
     """
-    Transitions a Jira issue to the target status (e.g. 'Done', 'Rejected').
-    Tries exact match → case-insensitive match → fallback to first available transition.
+    Transitions a Jira issue to the named status.
+    For approval  → pass 'Done'
+    For rejection → pass 'Rejected' (falls back through Won't Do → Cancelled → Done)
+    Tries exact match → case-insensitive match → rejection-specific fallbacks → Done.
     """
     transitions = jira_get_transitions(issue_key)
     if not transitions:
         log.warning(f"jira_transition_ticket: no transitions available for {issue_key}")
         return
 
-    tid = (
-        transitions.get(target_status)
-        or next((v for k, v in transitions.items() if k.lower() == target_status.lower()), None)
-        or transitions.get("Done")
-        or transitions.get("Close Issue")
-        or next(iter(transitions.values()), None)
-    )
+    # Exact match first
+    tid = transitions.get(target_status)
+
+    # Case-insensitive match
+    if not tid:
+        tid = next((v for k, v in transitions.items() if k.lower() == target_status.lower()), None)
+
+    # Rejection-specific fallback chain
+    if not tid and target_status.lower() in ("rejected", "reject", "won't do", "cancelled"):
+        tid = (
+            transitions.get("Won't Do")
+            or transitions.get("Cancelled")
+            or transitions.get("Invalid")
+            or transitions.get("Done")
+            or next(iter(transitions.values()), None)
+        )
+
+    # Generic fallback
+    if not tid:
+        tid = (
+            transitions.get("Done")
+            or transitions.get("Close Issue")
+            or next(iter(transitions.values()), None)
+        )
 
     if not tid:
-        log.warning(f"jira_transition_ticket: could not find transition '{target_status}' for {issue_key}")
+        log.warning(f"jira_transition_ticket: could not find any transition for '{target_status}' on {issue_key}")
         return
 
     url = f"{JIRA_BASE_URL}/rest/api/3/issue/{issue_key}/transitions"
@@ -626,8 +645,38 @@ def jira_transition_ticket(issue_key: str, target_status: str):
         )
         if resp.status_code not in (200, 204):
             log.warning(f"jira_transition_ticket: {resp.status_code} — {resp.text[:200]}")
+        else:
+            log.info(f"jira_transition_ticket: {issue_key} → '{target_status}' (tid={tid})")
     except Exception as e:
         log.error(f"jira_transition_ticket: {e}")
+
+
+def _jira_update_labels(issue_key: str, add_labels: list, remove_labels: list = None):
+    """
+    Adds/removes labels on a Jira issue.
+    Used to tag tickets as 'approved' or 'rejected' regardless of workflow status.
+    """
+    url = f"{JIRA_BASE_URL}/rest/api/3/issue/{issue_key}"
+    try:
+        resp = requests.get(url, auth=_jira_auth(), headers=_jira_headers(), timeout=10)
+        if resp.status_code != 200:
+            log.warning(f"_jira_update_labels: could not fetch issue {issue_key}: {resp.status_code}")
+            return
+        current = set(resp.json().get("fields", {}).get("labels", []))
+        for lbl in (remove_labels or []):
+            current.discard(lbl)
+        current.update(add_labels)
+        patch_resp = requests.put(
+            url,
+            json={"fields": {"labels": list(current)}},
+            auth=_jira_auth(),
+            headers=_jira_headers(),
+            timeout=10
+        )
+        if patch_resp.status_code not in (200, 204):
+            log.warning(f"_jira_update_labels: {patch_resp.status_code} — {patch_resp.text[:200]}")
+    except Exception as e:
+        log.error(f"_jira_update_labels: {e}")
 
 
 def jira_add_comment(issue_key: str, text: str):
@@ -993,12 +1042,13 @@ def execute_proxy_change(entry: dict, approver_id: str, approver_name: str):
             else:
                 post(f"⚠️ No full-net override found for `{ip}`")
 
-        # ── Close Jira ticket as Done ────────────────────────────────
+        # ── Close Jira ticket: Approved ───────────────────────────────
         jira_transition_ticket(jira_key, "Done")
+        _jira_update_labels(jira_key, add_labels=["approved"], remove_labels=["pending-approval"])
         timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
         jira_add_comment(
             jira_key,
-            f"Approved and executed by {approver_name} at {timestamp}"
+            f"APPROVED — executed by {approver_name} at {timestamp}"
         )
 
     except Exception as e:
@@ -1726,19 +1776,13 @@ def handle_reject(ack, body, client):
         except Exception as e:
             log.error(f"handle_reject: failed to notify requester: {e}")
 
-    # Close Jira ticket — try 'Rejected' status, fall back to 'Done'
+    # Close Jira ticket: Rejected
+    # jira_transition_ticket tries 'Rejected' → "Won't Do" → 'Cancelled' → 'Done'
     def _close():
-        transitions = jira_get_transitions(jira_key)
-        target = (
-            transitions.get("Rejected")
-            or transitions.get("rejected")
-            or transitions.get("Won't Do")
-            or transitions.get("Done")
-        )
-        if target:
-            jira_transition_ticket(jira_key, "Done")  # transition by name lookup inside
+        jira_transition_ticket(jira_key, "Rejected")
+        _jira_update_labels(jira_key, add_labels=["rejected"], remove_labels=["pending-approval"])
         timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-        jira_add_comment(jira_key, f"Rejected by {actor_name} at {timestamp}")
+        jira_add_comment(jira_key, f"REJECTED — by {actor_name} at {timestamp}")
 
     threading.Thread(target=_close, daemon=True).start()
 
