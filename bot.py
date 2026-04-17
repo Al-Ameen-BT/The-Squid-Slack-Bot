@@ -742,7 +742,7 @@ def is_admin(user_id: str) -> bool:
     return user_id in SLACK_ADMIN_USER_IDS
 
 
-def build_approval_blocks(jira_key: str, summary_text: str, requester_name: str, jira_url: str) -> list:
+def build_approval_blocks(jira_key: str, summary_text: str, requester_name: str) -> list:
     """Build the Slack Block Kit approval card."""
     return [
         {
@@ -758,7 +758,7 @@ def build_approval_blocks(jira_key: str, summary_text: str, requester_name: str,
             "elements": [
                 {
                     "type": "mrkdwn",
-                    "text": f"👤 Requested by *{requester_name}*  |  🔗 <{jira_url}|View Jira Ticket>"
+                    "text": f"👤 Requested by *{requester_name}*"
                 }
             ]
         },
@@ -883,6 +883,15 @@ def _post_to_channel(channel_id: str, text: str):
         log.error(f"_post_to_channel: {e}")
 
 
+def audit_log(text: str):
+    """Post an audit log message to the SLACK_ALERT_CHANNEL if configured."""
+    if SLACK_ALERT_CHANNEL:
+        try:
+            app.client.chat_postMessage(channel=SLACK_ALERT_CHANNEL, text=f"📝 *Audit Log:*\n{text}")
+        except Exception as e:
+            log.error(f"audit_log: {e}")
+
+
 def execute_proxy_change(entry: dict, approver_id: str, approver_name: str):
     """
     Execute the actual Squid proxy change for an approved request.
@@ -894,8 +903,10 @@ def execute_proxy_change(entry: dict, approver_id: str, approver_name: str):
     requester_channel = entry.get("requester_channel")
     jira_key          = entry["jira_key"]
 
-    def post(text):
+    def post(text, audit=False):
         _post_to_channel(requester_channel, text)
+        if audit:
+            audit_log(f"*[Ticket {jira_key}]*\n{text}")
 
     try:
         # ── /allow ──────────────────────────────────────────────────
@@ -948,7 +959,8 @@ def execute_proxy_change(entry: dict, approver_id: str, approver_name: str):
                 f"• {target_label}: `{domain}`\n"
                 f"• Dependencies: `{len(deps)}`\n"
                 f"• Expiry: {time_text}\n"
-                f"⚙️ Reloading Squid..."
+                f"⚙️ Reloading Squid...",
+                audit=True
             )
             reload_squid(channel=requester_channel)
 
@@ -975,7 +987,8 @@ def execute_proxy_change(entry: dict, approver_id: str, approver_name: str):
                 rebuild_override_configs()
                 post(
                     f"🚫 *Access removed* (approved by <@{approver_id}>)\n"
-                    f"`{domain}` removed from `{ip}`. ⚙️ Reloading Squid..."
+                    f"`{domain}` removed from `{ip}`. ⚙️ Reloading Squid...",
+                    audit=True
                 )
                 reload_squid(channel=requester_channel)
 
@@ -1013,7 +1026,8 @@ def execute_proxy_change(entry: dict, approver_id: str, approver_name: str):
                     f"⏱️ *Extended access* (approved by <@{approver_id}>)\n"
                     f"• IP: `{ip}`\n"
                     f"• Domain: `{domain}`\n"
-                    f"• Added: `{hours}h`"
+                    f"• Added: `{hours}h`",
+                    audit=True
                 )
 
         # ── /full-net ────────────────────────────────────────────────
@@ -1031,7 +1045,8 @@ def execute_proxy_change(entry: dict, approver_id: str, approver_name: str):
                     f.write(rule)
             post(
                 f"🔓 *Full Internet Enabled* for `{ip}` "
-                f"(approved by <@{approver_id}>). ⚙️ Reloading Squid..."
+                f"(approved by <@{approver_id}>). ⚙️ Reloading Squid...",
+                audit=True
             )
             reload_squid(channel=requester_channel)
 
@@ -1049,7 +1064,8 @@ def execute_proxy_change(entry: dict, approver_id: str, approver_name: str):
             if did_disable:
                 post(
                     f"🔒 *Restrictions Restored* for `{ip}` "
-                    f"(approved by <@{approver_id}>). ⚙️ Reloading Squid..."
+                    f"(approved by <@{approver_id}>). ⚙️ Reloading Squid...",
+                    audit=True
                 )
                 reload_squid(channel=requester_channel)
             else:
@@ -1249,6 +1265,11 @@ def expiry_worker():
                     entry = db[key]
                     log.info(
                         f"expiry_worker: expired — IP={entry['ip']} domain={entry['domain']}"
+                    )
+                    audit_log(
+                        f"⏰ *Access Expired*\n"
+                        f"• Client IP: `{entry['ip']}`\n"
+                        f"• Domain/IP: `{entry['domain']}`"
                     )
                     del db[key]
                 save_domains(db)
@@ -1786,6 +1807,7 @@ def handle_reject(ack, body, client):
                     f"🔗 {jira_url}"
                 )
             )
+            audit_log(f"❌ *[Ticket {jira_key}] Rejected*\n• Rejected by <@{actor_id}>")
         except Exception as e:
             log.error(f"handle_reject: failed to notify requester: {e}")
 
