@@ -7,6 +7,7 @@ import subprocess
 import ipaddress
 import tldextract
 import shutil
+import requests
 
 from urllib.parse import urlparse
 from datetime import datetime, timedelta, timezone
@@ -27,20 +28,35 @@ from playwright.sync_api import sync_playwright
 # ------------------------------------------------
 # CONFIGURATION & PERMISSIONS
 # ------------------------------------------------
-SLACK_BOT_TOKEN = os.environ.get("SLACK_BOT_TOKEN")
-SLACK_APP_TOKEN = os.environ.get("SLACK_APP_TOKEN")
-SLACK_LOG_CHANNEL = os.environ.get("SLACK_LOG_CHANNEL")
+SLACK_BOT_TOKEN     = os.environ.get("SLACK_BOT_TOKEN")
+SLACK_APP_TOKEN     = os.environ.get("SLACK_APP_TOKEN")
+SLACK_ALERT_CHANNEL = os.environ.get("SLACK_ALERT_CHANNEL")      # Squid crash/recovery alerts
+SLACK_ADMIN_CHANNEL = os.environ.get("SLACK_ADMIN_CHANNEL")      # Where approval cards are posted
+SLACK_ADMIN_USER_IDS = {
+    uid.strip()
+    for uid in os.environ.get("SLACK_ADMIN_USER_IDS", "").split(",")
+    if uid.strip()
+}
 
-LIST_DIR = "/etc/squid/lists"
-DOMAINS_FILE = "/etc/squid/domains.json"
-FULLNET_DIR = "/etc/squid/conf.d/fullnet"
-OVERRIDE_DIR = "/etc/squid/conf.d/override"
+# Jira
+JIRA_BASE_URL    = os.environ.get("JIRA_BASE_URL", "").rstrip("/")
+JIRA_EMAIL       = os.environ.get("JIRA_EMAIL", "")
+JIRA_API_TOKEN   = os.environ.get("JIRA_API_TOKEN", "")
+JIRA_PROJECT_KEY = os.environ.get("JIRA_PROJECT_KEY", "NET")
+
+LIST_DIR         = "/etc/squid/lists"
+DOMAINS_FILE     = "/etc/squid/domains.json"
+FULLNET_DIR      = "/etc/squid/conf.d/fullnet"
+OVERRIDE_DIR     = "/etc/squid/conf.d/override"
 ULTRAVIEWER_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ultraviewer.txt")
 CDN_DOMAINS_FILE = "/etc/squid/cdn_domains.txt"
-DOMAIN_CONF = "/etc/squid/conf.d/02-domain-lists.conf"
-HOSTS_CONF = "/etc/squid/conf.d/01-hosts.conf"
+DOMAIN_CONF      = "/etc/squid/conf.d/02-domain-lists.conf"
+HOSTS_CONF       = "/etc/squid/conf.d/01-hosts.conf"
 GROUP_RULES_CONF = "/etc/squid/conf.d/03-group.conf"
-RULES_CONF = "/etc/squid/conf.d/03-rules.conf"
+RULES_CONF       = "/etc/squid/conf.d/03-rules.conf"
+
+FILTER_CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "filter_config.json")
+PENDING_FILE       = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pending_requests.json")
 
 # STARTUP GUARD
 os.makedirs(FULLNET_DIR, exist_ok=True)
@@ -59,18 +75,16 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-app = App(token=SLACK_BOT_TOKEN)
-lock = threading.Lock()
-CDN_LIST = []
+app          = App(token=SLACK_BOT_TOKEN)
+lock         = threading.Lock()
+pending_lock = threading.Lock()
+CDN_LIST     = []
 
 # ------------------------------------------------
 # DISCOVERY FILTER CONFIG  (loaded from filter_config.json)
 # Edit filter_config.json to add/remove blocked domains or change
 # allowed resource types — no bot restart required.
 # ------------------------------------------------
-
-FILTER_CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "filter_config.json")
-
 
 def load_filter_config():
     """
@@ -332,7 +346,7 @@ def rebuild_override_configs():
     """
     os.makedirs(OVERRIDE_DIR, exist_ok=True)
     conf_path = os.path.join(OVERRIDE_DIR, "ultraviewer.conf")
-    
+
     db = load_domains()
     special = load_special_domains()  # config-driven: reads special_domains from filter_config.json
     uv_ips = set()
@@ -344,7 +358,7 @@ def rebuild_override_configs():
         root = f"{ext.domain}.{ext.suffix}" if ext.domain and ext.suffix else d
         if root in special:
             uv_ips.add(entry["ip"])
-            
+
     if not uv_ips:
         if os.path.exists(conf_path):
             os.remove(conf_path)
@@ -368,7 +382,7 @@ def validate_ip(ip):
     try:
         ipaddress.ip_address(ip)
         return True
-    except:
+    except ValueError:
         return False
 
 
@@ -393,7 +407,7 @@ def load_domains():
     try:
         with open(DOMAINS_FILE) as f:
             return json.load(f)
-    except:
+    except (json.JSONDecodeError, OSError):
         return {}
 
 
@@ -523,26 +537,473 @@ def reload_squid(channel=None):
 
 
 # ------------------------------------------------
-# AUDIT LOGGER
-# Posts structured action records to SLACK_LOG_CHANNEL.
-# Fire-and-forget: a Slack API failure never breaks command execution.
-# Set channel message retention to 15 days in Slack Admin settings.
+# JIRA INTEGRATION
 # ------------------------------------------------
 
-def audit_log(action: str, user_id: str, user_name: str, details: str, status: str = "✅ Success"):
-    """Post a structured audit log entry to the dedicated log channel."""
-    if not SLACK_LOG_CHANNEL:
-        return
-    timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-    text = (
-        f"{status} *[{action}]* by <@{user_id}> (`{user_name}`)\n"
-        f"{details}\n"
-        f"📅 `{timestamp}`"
-    )
+def _jira_auth():
+    return (JIRA_EMAIL, JIRA_API_TOKEN)
+
+def _jira_headers():
+    return {"Content-Type": "application/json", "Accept": "application/json"}
+
+
+def jira_create_ticket(summary: str, description: str, command_name: str) -> tuple:
+    """
+    Creates a Jira Task. Returns (issue_key, issue_id).
+    Raises RuntimeError on failure.
+    """
+    if not JIRA_BASE_URL or not JIRA_EMAIL or not JIRA_API_TOKEN:
+        raise RuntimeError("Jira credentials not configured — add JIRA_BASE_URL, JIRA_EMAIL, JIRA_API_TOKEN to .env")
+
+    url = f"{JIRA_BASE_URL}/rest/api/3/issue"
+    payload = {
+        "fields": {
+            "project":   {"key": JIRA_PROJECT_KEY},
+            "issuetype": {"name": "Task"},
+            "summary":   summary,
+            "description": {
+                "type": "doc",
+                "version": 1,
+                "content": [
+                    {
+                        "type": "paragraph",
+                        "content": [{"type": "text", "text": description}]
+                    }
+                ]
+            },
+            "labels": ["squid-proxy", "pending-approval", command_name]
+        }
+    }
+    resp = requests.post(url, json=payload, auth=_jira_auth(), headers=_jira_headers(), timeout=15)
+    if resp.status_code not in (200, 201):
+        raise RuntimeError(f"Jira API {resp.status_code}: {resp.text[:300]}")
+    data = resp.json()
+    return data["key"], data["id"]
+
+
+def jira_get_transitions(issue_key: str) -> dict:
+    """Returns {transition_name: transition_id} for an issue."""
+    url = f"{JIRA_BASE_URL}/rest/api/3/issue/{issue_key}/transitions"
     try:
-        app.client.chat_postMessage(channel=SLACK_LOG_CHANNEL, text=text)
+        resp = requests.get(url, auth=_jira_auth(), headers=_jira_headers(), timeout=10)
+        if resp.status_code == 200:
+            return {t["name"]: t["id"] for t in resp.json().get("transitions", [])}
     except Exception as e:
-        log.error(f"audit_log: failed to post to Slack: {e}")
+        log.warning(f"jira_get_transitions: {e}")
+    return {}
+
+
+def jira_transition_ticket(issue_key: str, target_status: str):
+    """
+    Transitions a Jira issue to the target status (e.g. 'Done', 'Rejected').
+    Tries exact match → case-insensitive match → fallback to first available transition.
+    """
+    transitions = jira_get_transitions(issue_key)
+    if not transitions:
+        log.warning(f"jira_transition_ticket: no transitions available for {issue_key}")
+        return
+
+    tid = (
+        transitions.get(target_status)
+        or next((v for k, v in transitions.items() if k.lower() == target_status.lower()), None)
+        or transitions.get("Done")
+        or transitions.get("Close Issue")
+        or next(iter(transitions.values()), None)
+    )
+
+    if not tid:
+        log.warning(f"jira_transition_ticket: could not find transition '{target_status}' for {issue_key}")
+        return
+
+    url = f"{JIRA_BASE_URL}/rest/api/3/issue/{issue_key}/transitions"
+    try:
+        resp = requests.post(
+            url,
+            json={"transition": {"id": tid}},
+            auth=_jira_auth(),
+            headers=_jira_headers(),
+            timeout=10
+        )
+        if resp.status_code not in (200, 204):
+            log.warning(f"jira_transition_ticket: {resp.status_code} — {resp.text[:200]}")
+    except Exception as e:
+        log.error(f"jira_transition_ticket: {e}")
+
+
+def jira_add_comment(issue_key: str, text: str):
+    """Adds a plain-text comment to a Jira issue."""
+    url = f"{JIRA_BASE_URL}/rest/api/3/issue/{issue_key}/comment"
+    payload = {
+        "body": {
+            "type": "doc",
+            "version": 1,
+            "content": [
+                {"type": "paragraph", "content": [{"type": "text", "text": text}]}
+            ]
+        }
+    }
+    try:
+        requests.post(url, json=payload, auth=_jira_auth(), headers=_jira_headers(), timeout=10)
+    except Exception as e:
+        log.error(f"jira_add_comment: {e}")
+
+
+# ------------------------------------------------
+# PENDING REQUESTS STORE
+# ------------------------------------------------
+
+def load_pending() -> dict:
+    """Load pending approval requests from disk."""
+    if not os.path.exists(PENDING_FILE):
+        return {}
+    try:
+        with open(PENDING_FILE) as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def save_pending(data: dict):
+    """Atomically save pending approval requests to disk."""
+    tmp = PENDING_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f, indent=2)
+    os.replace(tmp, PENDING_FILE)
+
+
+# ------------------------------------------------
+# ADMIN HELPERS
+# ------------------------------------------------
+
+def is_admin(user_id: str) -> bool:
+    """Returns True if the Slack user is in the configured admin list."""
+    return user_id in SLACK_ADMIN_USER_IDS
+
+
+def build_approval_blocks(jira_key: str, summary_text: str, requester_name: str, jira_url: str) -> list:
+    """Build the Slack Block Kit approval card."""
+    return [
+        {
+            "type": "header",
+            "text": {"type": "plain_text", "text": f"🎫 Proxy Change Request — {jira_key}", "emoji": True}
+        },
+        {
+            "type": "section",
+            "text": {"type": "mrkdwn", "text": summary_text}
+        },
+        {
+            "type": "context",
+            "elements": [
+                {
+                    "type": "mrkdwn",
+                    "text": f"👤 Requested by *{requester_name}*  |  🔗 <{jira_url}|View Jira Ticket>"
+                }
+            ]
+        },
+        {"type": "divider"},
+        {
+            "type": "actions",
+            "elements": [
+                {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": "✅  Approve", "emoji": True},
+                    "style": "primary",
+                    "action_id": "squid_approve",
+                    "value": jira_key
+                },
+                {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": "❌  Reject", "emoji": True},
+                    "style": "danger",
+                    "action_id": "squid_reject",
+                    "value": jira_key
+                }
+            ]
+        }
+    ]
+
+
+def _update_approval_card(client, entry: dict, status_text: str, actor_name: str):
+    """Replace the approval card buttons with a resolved status banner."""
+    msg_ts  = entry.get("slack_message_ts")
+    msg_ch  = entry.get("slack_message_channel")
+    if not msg_ts or not msg_ch:
+        return
+    try:
+        client.chat_update(
+            channel=msg_ch,
+            ts=msg_ts,
+            text=status_text,
+            blocks=[
+                {
+                    "type": "section",
+                    "text": {"type": "mrkdwn", "text": status_text}
+                },
+                {
+                    "type": "context",
+                    "elements": [
+                        {"type": "mrkdwn", "text": f"Actioned by *{actor_name}*"}
+                    ]
+                }
+            ]
+        )
+    except Exception as e:
+        log.error(f"_update_approval_card: {e}")
+
+
+def _submit_ticket(command_name: str, summary: str, description: str, args: dict,
+                   user_id: str, user_name: str, channel_id: str,
+                   summary_text: str) -> str | None:
+    """
+    Core helper called by every slash command handler.
+    Creates the Jira ticket, saves it to pending_requests.json,
+    posts the approval card, and returns the jira_key (or None on error).
+    """
+    try:
+        jira_key, jira_id = jira_create_ticket(summary, description, command_name)
+    except Exception as e:
+        return None, str(e)
+
+    jira_url = f"{JIRA_BASE_URL}/browse/{jira_key}"
+    entry = {
+        "jira_key":          jira_key,
+        "jira_id":           jira_id,
+        "command":           command_name,
+        "args":              args,
+        "requester_id":      user_id,
+        "requester_name":    user_name,
+        "requester_channel": channel_id,
+        "created_at":        datetime.now(timezone.utc).timestamp(),
+        "status":            "pending",
+        "slack_message_ts":       None,
+        "slack_message_channel":  None,
+    }
+
+    with pending_lock:
+        pending = load_pending()
+        pending[jira_key] = entry
+        save_pending(pending)
+
+    # Post approval card to admin channel
+    if SLACK_ADMIN_CHANNEL:
+        try:
+            msg_result = app.client.chat_postMessage(
+                channel=SLACK_ADMIN_CHANNEL,
+                text=f"🎫 Proxy Change Request {jira_key} — awaiting approval",
+                blocks=build_approval_blocks(jira_key, summary_text, user_name, jira_url)
+            )
+            with pending_lock:
+                pending = load_pending()
+                if jira_key in pending:
+                    pending[jira_key]["slack_message_ts"]      = msg_result["ts"]
+                    pending[jira_key]["slack_message_channel"] = SLACK_ADMIN_CHANNEL
+                    save_pending(pending)
+        except Exception as e:
+            log.error(f"_submit_ticket: failed to post approval card: {e}")
+    else:
+        log.warning("SLACK_ADMIN_CHANNEL not set — approval card not sent.")
+
+    return jira_key, None
+
+
+# ------------------------------------------------
+# EXECUTE PROXY CHANGE (called after admin approval)
+# Runs in a background thread — do NOT hold any locks when calling this.
+# ------------------------------------------------
+
+def _post_to_channel(channel_id: str, text: str):
+    """Fire-and-forget message to a Slack channel."""
+    if not channel_id:
+        return
+    try:
+        app.client.chat_postMessage(channel=channel_id, text=text)
+    except Exception as e:
+        log.error(f"_post_to_channel: {e}")
+
+
+def execute_proxy_change(entry: dict, approver_id: str, approver_name: str):
+    """
+    Execute the actual Squid proxy change for an approved request.
+    Designed to run in a background thread.
+    Posts updates to the requester's channel.
+    """
+    command_name      = entry["command"]
+    args              = entry["args"]
+    requester_channel = entry.get("requester_channel")
+    jira_key          = entry["jira_key"]
+
+    def post(text):
+        _post_to_channel(requester_channel, text)
+
+    try:
+        # ── /allow ──────────────────────────────────────────────────
+        if command_name == "allow":
+            ip               = args["ip"]
+            domain           = args["domain"]
+            expiry_timestamp = args.get("expiry_timestamp")
+            time_text        = args.get("time_text", "indefinitely ♾️")
+            is_dest_ip       = args.get("is_dest_ip", False)
+            deps             = set()
+
+            if is_dest_ip:
+                post(f"⚙️ Allowing destination IP `{domain}` for client `{ip}`...")
+            else:
+                ULTRAVIEWER_DOMAINS = load_special_domains()
+                ext = tldextract.extract(domain)
+                root_domain  = f"{ext.domain}.{ext.suffix}"
+                is_ultraviewer = root_domain in ULTRAVIEWER_DOMAINS
+
+                if is_ultraviewer:
+                    post(f"⚙️ Applying UltraViewer override for `{ip}`...")
+                    base = classify(domain)
+                    if base:
+                        deps.add(base)
+                else:
+                    post(f"⚙️ Processing `{domain}` for `{ip}`...")
+                    deps = discover(domain, post)
+                    base = classify(domain)
+                    if base:
+                        deps.add(base)
+
+            with lock:
+                db = load_domains()
+                db[f"{ip}:{domain}"] = {
+                    "ip":      ip,
+                    "domain":  domain,
+                    "deps":    list(deps),
+                    "expires": expiry_timestamp
+                }
+                save_domains(db)
+                rebuild_ip_file(ip, db)
+
+            regenerate_squid_configs()
+            rebuild_override_configs()
+
+            target_label = "Destination IP" if is_dest_ip else "Domain"
+            post(
+                f"✅ *Access granted* (approved by <@{approver_id}>)\n"
+                f"• Client IP: `{ip}`\n"
+                f"• {target_label}: `{domain}`\n"
+                f"• Dependencies: `{len(deps)}`\n"
+                f"• Expiry: {time_text}\n"
+                f"⚙️ Reloading Squid..."
+            )
+            reload_squid(channel=requester_channel)
+
+        # ── /deny ───────────────────────────────────────────────────
+        elif command_name == "deny":
+            ip     = args["ip"]
+            domain = args["domain"]
+            key    = f"{ip}:{domain}"
+            not_found = False
+
+            with lock:
+                db = load_domains()
+                if key not in db:
+                    not_found = True
+                else:
+                    del db[key]
+                    save_domains(db)
+                    rebuild_ip_file(ip, db)
+
+            if not_found:
+                post(f"⚠️ `{domain}` not found for `{ip}` — may have already been removed.")
+            else:
+                regenerate_squid_configs()
+                rebuild_override_configs()
+                post(
+                    f"🚫 *Access removed* (approved by <@{approver_id}>)\n"
+                    f"`{domain}` removed from `{ip}`. ⚙️ Reloading Squid..."
+                )
+                reload_squid(channel=requester_channel)
+
+        # ── /extend ─────────────────────────────────────────────────
+        elif command_name == "extend":
+            ip     = args["ip"]
+            domain = args["domain"]
+            hours  = args["hours"]
+            extra_seconds = hours * 3600
+            key    = f"{ip}:{domain}"
+            result = None
+
+            with lock:
+                db = load_domains()
+                if key not in db:
+                    result = "not_found"
+                else:
+                    db_entry = db[key]
+                    now = datetime.now(timezone.utc).timestamp()
+                    if not db_entry.get("expires"):
+                        result = "no_expiry"
+                    else:
+                        base_time = max(now, db_entry["expires"])
+                        db_entry["expires"] = base_time + extra_seconds
+                        db[key] = db_entry
+                        save_domains(db)
+                        result = "ok"
+
+            if result == "not_found":
+                post(f"⚠️ No active rule found for `{domain}` on `{ip}`")
+            elif result == "no_expiry":
+                post(f"⚠️ `{domain}` for `{ip}` has no expiry to extend.")
+            else:
+                post(
+                    f"⏱️ *Extended access* (approved by <@{approver_id}>)\n"
+                    f"• IP: `{ip}`\n"
+                    f"• Domain: `{domain}`\n"
+                    f"• Added: `{hours}h`"
+                )
+
+        # ── /full-net ────────────────────────────────────────────────
+        elif command_name == "full-net":
+            ip        = args["ip"]
+            safe_name = ip.replace(".", "_")
+            path      = os.path.join(FULLNET_DIR, f"{ip}.conf")
+            rule = (
+                f"# Override for {ip}\n"
+                f"acl fullnet_{safe_name} src {ip}\n"
+                f"http_access allow fullnet_{safe_name}\n"
+            )
+            with lock:
+                with open(path, "w") as f:
+                    f.write(rule)
+            post(
+                f"🔓 *Full Internet Enabled* for `{ip}` "
+                f"(approved by <@{approver_id}>). ⚙️ Reloading Squid..."
+            )
+            reload_squid(channel=requester_channel)
+
+        # ── /lock-net ────────────────────────────────────────────────
+        elif command_name == "lock-net":
+            ip           = args["ip"]
+            path         = os.path.join(FULLNET_DIR, f"{ip}.conf")
+            did_disable  = False
+            with lock:
+                if os.path.exists(path):
+                    with open(path, "w") as f:
+                        f.write("# Disabled by /lock-net command\n")
+                    did_disable = True
+
+            if did_disable:
+                post(
+                    f"🔒 *Restrictions Restored* for `{ip}` "
+                    f"(approved by <@{approver_id}>). ⚙️ Reloading Squid..."
+                )
+                reload_squid(channel=requester_channel)
+            else:
+                post(f"⚠️ No full-net override found for `{ip}`")
+
+        # ── Close Jira ticket as Done ────────────────────────────────
+        jira_transition_ticket(jira_key, "Done")
+        timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+        jira_add_comment(
+            jira_key,
+            f"Approved and executed by {approver_name} at {timestamp}"
+        )
+
+    except Exception as e:
+        log.error(f"execute_proxy_change [{jira_key}]: {e}")
+        post(f"❌ Error executing approved request `{jira_key}`: {e}")
 
 
 # ------------------------------------------------
@@ -568,7 +1029,8 @@ def discover(domain, respond):
     # This lets the domain's own CDNs be discovered as dependencies instead
     # of being silently blocked.
     effective_blocklist = set(social_ad_blocklist)
-    requested_root = f"{tldextract.extract(domain).domain}.{tldextract.extract(domain).suffix}"
+    ext_info = tldextract.extract(domain)
+    requested_root = f"{ext_info.domain}.{ext_info.suffix}"
 
     if requested_root in effective_blocklist or domain.lower() in effective_blocklist:
         try:
@@ -608,7 +1070,7 @@ def discover(domain, respond):
                 d = classify(host)
                 if d:
                     discovered.add(d)
-            except:
+            except Exception:
                 pass
 
         def on_frame(frame):
@@ -622,7 +1084,7 @@ def discover(domain, respond):
                 d = classify(host)
                 if d:
                     discovered.add(d)
-            except:
+            except Exception:
                 pass
 
         page.on("request", on_request)
@@ -666,7 +1128,7 @@ def discover(domain, respond):
                     wait_until="domcontentloaded"
                 )
                 if response:
-                    final_url = response.url
+                    final_url  = response.url
                     final_host = urlparse(final_url).hostname
                     if final_host:
                         d = classify(final_host)
@@ -722,12 +1184,8 @@ def expiry_worker():
             if expired_rules:
                 for key in expired_rules:
                     entry = db[key]
-                    audit_log(
-                        action="EXPIRED",
-                        user_id="SYSTEM",
-                        user_name="expiry_worker",
-                        details=f"• IP: `{entry['ip']}`\n• Domain: `{entry['domain']}` — access expired automatically",
-                        status="⏳ Expired"
+                    log.info(
+                        f"expiry_worker: expired — IP={entry['ip']} domain={entry['domain']}"
                     )
                     del db[key]
                 save_domains(db)
@@ -766,7 +1224,7 @@ def expiry_worker():
 
 
 # ------------------------------------------------
-# SLASH COMMANDS
+# SLASH COMMANDS — now create Jira tickets + request approval
 # ------------------------------------------------
 
 @app.command("/allow")
@@ -795,79 +1253,60 @@ def allow_cmd(ack, respond, command):
             respond("❌ Error: Time must be like `1h`, `1.5h`, or `24h`.")
             return
 
-    # Validate
     if not validate_ip(ip):
         respond(f"❌ Invalid IP: {ip}")
         return
 
-    if is_destination_ip(raw_target):
+    is_dest_ip = is_destination_ip(raw_target)
+    if is_dest_ip:
         domain = canonical_destination_ip(raw_target)
-        deps = set()
-        respond(f"⚙️ Allowing destination IP `{domain}` for client `{ip}`...")
     else:
         domain = normalize(raw_target)
         if not validate_domain(domain):
             respond(f"❌ Invalid domain: {domain}")
             return
 
-        # Extract required base info
-        ext = tldextract.extract(domain)
-        root_domain = f"{ext.domain}.{ext.suffix}"
-        ULTRAVIEWER_DOMAINS = load_special_domains()
-        is_ultraviewer = root_domain in ULTRAVIEWER_DOMAINS
+    target_label = "Destination IP" if is_dest_ip else "Domain"
+    summary = f"[ALLOW] {ip} → {domain} ({time_text}) — @{command['user_name']}"
+    description = (
+        f"Proxy Change Request\n\n"
+        f"Command:       /allow\n"
+        f"Client IP:     {ip}\n"
+        f"{target_label}: {domain}\n"
+        f"Duration:      {time_text}\n"
+        f"Requester:     {command['user_name']} ({command['user_id']})\n"
+        f"Requested at:  {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}\n"
+    )
+    summary_text = (
+        f"*Command:* `/allow`\n"
+        f"*Client IP:* `{ip}`\n"
+        f"*{target_label}:* `{domain}`\n"
+        f"*Duration:* {time_text}"
+    )
+    cmd_args = {
+        "ip": ip, "domain": domain,
+        "is_dest_ip": is_dest_ip,
+        "expiry_timestamp": expiry_timestamp,
+        "time_text": time_text
+    }
 
-        # Processing
-        if is_ultraviewer:
-            respond(f"⚙️ Applying UltraViewer override for `{ip}`...")
-            deps = set()
-            base = classify(domain)
-            if base:
-                deps.add(base)
-        else:
-            respond(f"⚙️ Processing `{domain}` for `{ip}`...")
-            deps = discover(domain, respond)
-            base = classify(domain)
-            if base:
-                deps.add(base)
+    jira_key, err = _submit_ticket(
+        "allow", summary, description, cmd_args,
+        command["user_id"], command["user_name"], command["channel_id"],
+        summary_text
+    )
+    if err:
+        respond(f"❌ Failed to create Jira ticket: {err}")
+        return
 
-    # Persist
-    with lock:
-        db = load_domains()
-        db[f"{ip}:{domain}"] = {
-            "ip": ip,
-            "domain": domain,
-            "deps": list(deps),
-            "expires": expiry_timestamp
-        }
-        save_domains(db)
-        rebuild_ip_file(ip, db)
-
-    # Config + reload
-    regenerate_squid_configs()
-    rebuild_override_configs()
-
-    target_label = "Destination IP" if validate_ip(domain) else "Domain"
+    jira_url = f"{JIRA_BASE_URL}/browse/{jira_key}"
     respond(
-        f"✅ *Access granted*\n"
+        f"🎫 *Request submitted — {jira_key}*\n"
         f"• Client IP: `{ip}`\n"
         f"• {target_label}: `{domain}`\n"
-        f"• Dependencies: `{len(deps)}`\n"
-        f"• Expiry: {time_text}\n"
-        f"⚙️ Reloading Squid..."
-    )
-
-    reload_squid(channel=command.get("channel_id"))
-
-    audit_log(
-        action="ALLOW",
-        user_id=command["user_id"],
-        user_name=command["user_name"],
-        details=(
-            f"• IP: `{ip}`\n"
-            f"• Domain: `{domain}`\n"
-            f"• Expiry: {time_text}\n"
-            f"• Dependencies discovered: `{len(deps)}`"
-        )
+        f"• Duration: {time_text}\n"
+        f"• Status: ⏳ Awaiting admin approval\n"
+        f"🔗 {jira_url}"
     )
 
 
@@ -895,39 +1334,40 @@ def deny_cmd(ack, respond, command):
         if is_destination_ip(raw_target)
         else normalize(raw_target)
     )
-    key = f"{ip}:{domain}"
-    not_found = False
 
-    with lock:
-        db = load_domains()
-        if key not in db:
-            not_found = True
-        else:
-            del db[key]
-            save_domains(db)
-            # FIX: use rebuild_ip_file (db-driven) so the file stays in sync
-            # with domains.json. Consistent with allow_cmd and expiry_worker.
-            rebuild_ip_file(ip, db)
+    target_label = "Destination IP" if validate_ip(domain) else "Domain"
+    summary = f"[DENY] {ip} → {domain} — @{command['user_name']}"
+    description = (
+        f"Proxy Change Request\n\n"
+        f"Command:       /deny\n"
+        f"Client IP:     {ip}\n"
+        f"{target_label}: {domain}\n"
+        f"Requester:     {command['user_name']} ({command['user_id']})\n"
+        f"Requested at:  {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}\n"
+    )
+    summary_text = (
+        f"*Command:* `/deny`\n"
+        f"*Client IP:* `{ip}`\n"
+        f"*{target_label}:* `{domain}`"
+    )
+    cmd_args = {"ip": ip, "domain": domain}
 
-    if not_found:
-        respond(f"⚠️ `{domain}` not found for `{ip}`")
+    jira_key, err = _submit_ticket(
+        "deny", summary, description, cmd_args,
+        command["user_id"], command["user_name"], command["channel_id"],
+        summary_text
+    )
+    if err:
+        respond(f"❌ Failed to create Jira ticket: {err}")
         return
 
-    regenerate_squid_configs()
-    rebuild_override_configs()
-
-    # FIX: respond() BEFORE reload — Slack webhook expires in ~3s.
-    respond(f"🚫 `{domain}` removed from `{ip}`. ⚙️ Reloading Squid...")
-    reload_squid(channel=command.get("channel_id"))
-
-    audit_log(
-        action="DENY",
-        user_id=command["user_id"],
-        user_name=command["user_name"],
-        details=(
-            f"• IP: `{ip}`\n"
-            f"• Domain: `{domain}` — access revoked"
-        )
+    jira_url = f"{JIRA_BASE_URL}/browse/{jira_key}"
+    respond(
+        f"🎫 *Request submitted — {jira_key}*\n"
+        f"• Client IP: `{ip}`\n"
+        f"• {target_label}: `{domain}`\n"
+        f"• Status: ⏳ Awaiting admin approval\n"
+        f"🔗 {jira_url}"
     )
 
 
@@ -964,65 +1404,42 @@ def extend_cmd(ack, respond, command):
         respond("❌ Time must be like `1h`, `1.5h`, `24h`")
         return
 
-    extra_seconds = hours * 3600
-    key = f"{ip}:{domain}"
-    result = None
-
-    with lock:
-        db = load_domains()
-        if key not in db:
-            result = "not_found"
-        else:
-            entry = db[key]
-            now = datetime.now(timezone.utc).timestamp()
-            if not entry.get("expires"):
-                result = "no_expiry"
-            else:
-                current_expiry = entry["expires"]
-                base_time = max(now, current_expiry)
-                entry["expires"] = base_time + extra_seconds
-                db[key] = entry
-                save_domains(db)
-                result = "ok"
-
-    if result == "not_found":
-        respond(f"⚠️ No active rule found for `{domain}` on `{ip}`")
-        audit_log(
-            action="EXTEND",
-            user_id=command["user_id"],
-            user_name=command["user_name"],
-            details=f"• IP: `{ip}`\n• Domain: `{domain}` — rule not found",
-            status="⚠️ Not Found"
-        )
-        return
-
-    if result == "no_expiry":
-        respond(f"⚠️ `{domain}` for `{ip}` has no expiry to extend.")
-        audit_log(
-            action="EXTEND",
-            user_id=command["user_id"],
-            user_name=command["user_name"],
-            details=f"• IP: `{ip}`\n• Domain: `{domain}` — rule is permanent (no expiry)",
-            status="⚠️ Skipped"
-        )
-        return
-
-    respond(
-        f"⏱️ *Extended access*\n"
-        f"• IP: `{ip}`\n"
-        f"• Domain: `{domain}`\n"
-        f"• Added: `{hours}h`"
+    target_label = "Destination IP" if validate_ip(domain) else "Domain"
+    summary = f"[EXTEND] {ip} → {domain} (+{hours}h) — @{command['user_name']}"
+    description = (
+        f"Proxy Change Request\n\n"
+        f"Command:       /extend\n"
+        f"Client IP:     {ip}\n"
+        f"{target_label}: {domain}\n"
+        f"Extension:     {hours}h\n"
+        f"Requester:     {command['user_name']} ({command['user_id']})\n"
+        f"Requested at:  {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}\n"
     )
-    audit_log(
-        action="EXTEND",
-        user_id=command["user_id"],
-        user_name=command["user_name"],
-        details=(
-            f"• IP: `{ip}`\n"
-            f"• Domain: `{domain}`\n"
-            f"• Added: `{hours}h`"
-        ),
-        status="⏱️ Extended"
+    summary_text = (
+        f"*Command:* `/extend`\n"
+        f"*Client IP:* `{ip}`\n"
+        f"*{target_label}:* `{domain}`\n"
+        f"*Extension:* `{hours}h`"
+    )
+    cmd_args = {"ip": ip, "domain": domain, "hours": hours}
+
+    jira_key, err = _submit_ticket(
+        "extend", summary, description, cmd_args,
+        command["user_id"], command["user_name"], command["channel_id"],
+        summary_text
+    )
+    if err:
+        respond(f"❌ Failed to create Jira ticket: {err}")
+        return
+
+    jira_url = f"{JIRA_BASE_URL}/browse/{jira_key}"
+    respond(
+        f"🎫 *Request submitted — {jira_key}*\n"
+        f"• Client IP: `{ip}`\n"
+        f"• {target_label}: `{domain}`\n"
+        f"• Extension: `{hours}h`\n"
+        f"• Status: ⏳ Awaiting admin approval\n"
+        f"🔗 {jira_url}"
     )
 
 
@@ -1037,25 +1454,39 @@ def fullnet_cmd(ack, respond, command):
     if not validate_ip(ip):
         respond("❌ Invalid IP")
         return
-    safe_name = ip.replace(".", "_")
-    path = os.path.join(FULLNET_DIR, f"{ip}.conf")
-    rule = (
-        f"# Override for {ip}\n"
-        f"acl fullnet_{safe_name} src {ip}\n"
-        f"http_access allow fullnet_{safe_name}\n"
+
+    summary = f"[FULL-NET] {ip} — unrestricted access — @{command['user_name']}"
+    description = (
+        f"Proxy Change Request\n\n"
+        f"Command:       /full-net\n"
+        f"Client IP:     {ip}\n"
+        f"Effect:        Grants unrestricted internet access\n"
+        f"Requester:     {command['user_name']} ({command['user_id']})\n"
+        f"Requested at:  {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}\n"
     )
-    with lock:
-        with open(path, "w") as f:
-            f.write(rule)
-    # FIX: respond() BEFORE reload — Slack webhook expires in ~3s.
-    respond(f"🔓 *Full Internet Enabled* for `{ip}`. ⚙️ Reloading Squid...")
-    reload_squid(channel=command.get("channel_id"))
-    audit_log(
-        action="FULL-NET",
-        user_id=command["user_id"],
-        user_name=command["user_name"],
-        details=f"• IP: `{ip}` — unrestricted internet access granted",
-        status="🔓 Enabled"
+    summary_text = (
+        f"*Command:* `/full-net`\n"
+        f"*Client IP:* `{ip}`\n"
+        f"*Effect:* 🔓 Unrestricted internet access"
+    )
+    cmd_args = {"ip": ip}
+
+    jira_key, err = _submit_ticket(
+        "full-net", summary, description, cmd_args,
+        command["user_id"], command["user_name"], command["channel_id"],
+        summary_text
+    )
+    if err:
+        respond(f"❌ Failed to create Jira ticket: {err}")
+        return
+
+    jira_url = f"{JIRA_BASE_URL}/browse/{jira_key}"
+    respond(
+        f"🎫 *Request submitted — {jira_key}*\n"
+        f"• Client IP: `{ip}`\n"
+        f"• Effect: 🔓 Full internet access\n"
+        f"• Status: ⏳ Awaiting admin approval\n"
+        f"🔗 {jira_url}"
     )
 
 
@@ -1070,32 +1501,44 @@ def locknet_cmd(ack, respond, command):
     if not validate_ip(ip):
         respond("❌ Invalid IP")
         return
-    path = os.path.join(FULLNET_DIR, f"{ip}.conf")
-    did_disable = False
-    with lock:
-        if os.path.exists(path):
-            with open(path, "w") as f:
-                f.write("# Disabled by /lock-net command\n")
-            did_disable = True
-    # reload_squid() called OUTSIDE lock — it acquires the same lock
-    # internally and would deadlock if called from within the with block.
-    if did_disable:
-        # FIX: respond() BEFORE reload — Slack webhook expires in ~3s.
-        respond(f"🔒 *Restrictions Restored* for `{ip}`. ⚙️ Reloading Squid...")
-        reload_squid(channel=command.get("channel_id"))
-        audit_log(
-            action="LOCK-NET",
-            user_id=command["user_id"],
-            user_name=command["user_name"],
-            details=f"• IP: `{ip}` — full-net access revoked, normal restrictions restored",
-            status="🔒 Locked"
-        )
-    else:
-        respond(f"⚠️ No full-net override found for `{ip}`")
+
+    summary = f"[LOCK-NET] {ip} — restore restrictions — @{command['user_name']}"
+    description = (
+        f"Proxy Change Request\n\n"
+        f"Command:       /lock-net\n"
+        f"Client IP:     {ip}\n"
+        f"Effect:        Revokes full-net access, restores normal restrictions\n"
+        f"Requester:     {command['user_name']} ({command['user_id']})\n"
+        f"Requested at:  {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}\n"
+    )
+    summary_text = (
+        f"*Command:* `/lock-net`\n"
+        f"*Client IP:* `{ip}`\n"
+        f"*Effect:* 🔒 Restore normal restrictions"
+    )
+    cmd_args = {"ip": ip}
+
+    jira_key, err = _submit_ticket(
+        "lock-net", summary, description, cmd_args,
+        command["user_id"], command["user_name"], command["channel_id"],
+        summary_text
+    )
+    if err:
+        respond(f"❌ Failed to create Jira ticket: {err}")
+        return
+
+    jira_url = f"{JIRA_BASE_URL}/browse/{jira_key}"
+    respond(
+        f"🎫 *Request submitted — {jira_key}*\n"
+        f"• Client IP: `{ip}`\n"
+        f"• Effect: 🔒 Restore restrictions\n"
+        f"• Status: ⏳ Awaiting admin approval\n"
+        f"🔗 {jira_url}"
+    )
 
 
 # ------------------------------------------------
-# LIST
+# LIST  (read-only — instant, no ticket needed)
 # ------------------------------------------------
 
 @app.command("/list")
@@ -1125,7 +1568,7 @@ def list_cmd(ack, respond, command):
 
     lines = [f"Allowed domains for `{ip}`:"]
     for idx, rule in enumerate(sorted(ip_rules, key=lambda x: x["domain"])):
-        domain = rule["domain"]
+        domain  = rule["domain"]
         expires = rule.get("expires")
         if expires:
             dt = datetime.fromtimestamp(expires, timezone.utc)
@@ -1142,19 +1585,178 @@ def list_cmd(ack, respond, command):
 
 
 # ------------------------------------------------
+# APPROVAL ACTION HANDLERS
+# ------------------------------------------------
+
+@app.action("squid_approve")
+def handle_approve(ack, body, client):
+    ack()
+    actor_id   = body["user"]["id"]
+    actor_name = body["user"].get("name", actor_id)
+
+    if not is_admin(actor_id):
+        try:
+            client.chat_postEphemeral(
+                channel=body["channel"]["id"],
+                user=actor_id,
+                text="⛔ You are not authorized to approve proxy requests."
+            )
+        except Exception as e:
+            log.error(f"handle_approve: ephemeral error: {e}")
+        return
+
+    jira_key = body["actions"][0]["value"]
+
+    # Claim the request atomically
+    with pending_lock:
+        pending = load_pending()
+        entry   = pending.get(jira_key)
+
+        if not entry:
+            try:
+                client.chat_postEphemeral(
+                    channel=body["channel"]["id"],
+                    user=actor_id,
+                    text=f"⚠️ Request `{jira_key}` not found. It may have already been processed."
+                )
+            except Exception:
+                pass
+            return
+
+        if entry["status"] != "pending":
+            try:
+                client.chat_postEphemeral(
+                    channel=body["channel"]["id"],
+                    user=actor_id,
+                    text=f"⚠️ `{jira_key}` has already been *{entry['status']}*."
+                )
+            except Exception:
+                pass
+            return
+
+        entry["status"] = "approved"
+        pending[jira_key] = entry
+        save_pending(pending)
+
+    # Update the approval card immediately
+    _update_approval_card(
+        client, entry,
+        f"✅ *{jira_key}* approved by *{actor_name}* — executing...",
+        actor_name
+    )
+
+    # Execute the proxy change in a background thread
+    threading.Thread(
+        target=execute_proxy_change,
+        args=(entry, actor_id, actor_name),
+        daemon=True
+    ).start()
+
+
+@app.action("squid_reject")
+def handle_reject(ack, body, client):
+    ack()
+    actor_id   = body["user"]["id"]
+    actor_name = body["user"].get("name", actor_id)
+
+    if not is_admin(actor_id):
+        try:
+            client.chat_postEphemeral(
+                channel=body["channel"]["id"],
+                user=actor_id,
+                text="⛔ You are not authorized to reject proxy requests."
+            )
+        except Exception as e:
+            log.error(f"handle_reject: ephemeral error: {e}")
+        return
+
+    jira_key = body["actions"][0]["value"]
+
+    # Claim the request atomically
+    with pending_lock:
+        pending = load_pending()
+        entry   = pending.get(jira_key)
+
+        if not entry:
+            try:
+                client.chat_postEphemeral(
+                    channel=body["channel"]["id"],
+                    user=actor_id,
+                    text=f"⚠️ Request `{jira_key}` not found."
+                )
+            except Exception:
+                pass
+            return
+
+        if entry["status"] != "pending":
+            try:
+                client.chat_postEphemeral(
+                    channel=body["channel"]["id"],
+                    user=actor_id,
+                    text=f"⚠️ `{jira_key}` has already been *{entry['status']}*."
+                )
+            except Exception:
+                pass
+            return
+
+        entry["status"] = "rejected"
+        pending[jira_key] = entry
+        save_pending(pending)
+
+    # Update the approval card
+    _update_approval_card(
+        client, entry,
+        f"❌ *{jira_key}* rejected by *{actor_name}*",
+        actor_name
+    )
+
+    # Notify requester
+    requester_channel = entry.get("requester_channel")
+    if requester_channel:
+        try:
+            jira_url = f"{JIRA_BASE_URL}/browse/{jira_key}"
+            client.chat_postMessage(
+                channel=requester_channel,
+                text=(
+                    f"❌ *Your request was rejected — {jira_key}*\n"
+                    f"• Rejected by: <@{actor_id}>\n"
+                    f"🔗 {jira_url}"
+                )
+            )
+        except Exception as e:
+            log.error(f"handle_reject: failed to notify requester: {e}")
+
+    # Close Jira ticket — try 'Rejected' status, fall back to 'Done'
+    def _close():
+        transitions = jira_get_transitions(jira_key)
+        target = (
+            transitions.get("Rejected")
+            or transitions.get("rejected")
+            or transitions.get("Won't Do")
+            or transitions.get("Done")
+        )
+        if target:
+            jira_transition_ticket(jira_key, "Done")  # transition by name lookup inside
+        timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+        jira_add_comment(jira_key, f"Rejected by {actor_name} at {timestamp}")
+
+    threading.Thread(target=_close, daemon=True).start()
+
+
+# ------------------------------------------------
 # SQUID MONITOR WORKER
 # ------------------------------------------------
 
 def squid_monitor_worker():
-    if not SLACK_LOG_CHANNEL:
-        log.warning("SLACK_LOG_CHANNEL not set. Squid crash alerts disabled.")
+    if not SLACK_ALERT_CHANNEL:
+        log.warning("SLACK_ALERT_CHANNEL not set. Squid crash alerts disabled.")
         return
 
     squid_was_down = False
 
     while True:
         try:
-            result = subprocess.run(["systemctl", "is-active", "squid"], capture_output=True, text=True)
+            result    = subprocess.run(["systemctl", "is-active", "squid"], capture_output=True, text=True)
             is_active = result.stdout.strip() == "active"
             timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
@@ -1163,7 +1765,7 @@ def squid_monitor_worker():
                 log.error("Squid status monitor: Squid is offline!")
                 try:
                     app.client.chat_postMessage(
-                        channel=SLACK_LOG_CHANNEL,
+                        channel=SLACK_ALERT_CHANNEL,
                         text=(
                             f"🚨 *[SQUID-DOWN]*\n"
                             f"• The Squid proxy engine has gone *offline* or failed to reload.\n"
@@ -1179,7 +1781,7 @@ def squid_monitor_worker():
                 log.info("Squid status monitor: Squid is back online.")
                 try:
                     app.client.chat_postMessage(
-                        channel=SLACK_LOG_CHANNEL,
+                        channel=SLACK_ALERT_CHANNEL,
                         text=(
                             f"✅ *[SQUID-RECOVERY]*\n"
                             f"• The Squid proxy engine is back *online* and functioning normally.\n"
@@ -1204,9 +1806,9 @@ if __name__ == "__main__":
     rebuild_override_configs()
     reload_squid()
 
-    threading.Thread(target=expiry_worker, daemon=True).start()
+    threading.Thread(target=expiry_worker,       daemon=True).start()
     threading.Thread(target=squid_monitor_worker, daemon=True).start()
 
     handler = SocketModeHandler(app, SLACK_APP_TOKEN)
-    print("🚀 Slack Squid Bot is active and monitoring...")
+    print("🚀 Slack Squid Bot is active — Jira ticketing enabled.")
     handler.start()
