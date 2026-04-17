@@ -582,12 +582,25 @@ def jira_create_ticket(summary: str, description: str, command_name: str) -> tup
 
 
 def jira_get_transitions(issue_key: str) -> dict:
-    """Returns {transition_name: transition_id} for an issue."""
+    """
+    Returns a dict mapping both:
+      - transition action name  → transition id   (e.g. 'Approve' → '21')
+      - destination status name → transition id   (e.g. 'Approved' → '21')
+    This lets jira_transition_ticket find the right transition regardless of
+    how the workflow action is labelled in Jira.
+    """
     url = f"{JIRA_BASE_URL}/rest/api/3/issue/{issue_key}/transitions"
     try:
         resp = requests.get(url, auth=_jira_auth(), headers=_jira_headers(), timeout=10)
         if resp.status_code == 200:
-            return {t["name"]: t["id"] for t in resp.json().get("transitions", [])}
+            result = {}
+            for t in resp.json().get("transitions", []):
+                result[t["name"]] = t["id"]                    # action name  e.g. 'Approve'
+                to_status = t.get("to", {}).get("name", "")
+                if to_status and to_status not in result:
+                    result[to_status] = t["id"]               # dest status  e.g. 'Approved'
+            log.debug(f"jira_get_transitions [{issue_key}]: {list(result.keys())}")
+            return result
     except Exception as e:
         log.warning(f"jira_get_transitions: {e}")
     return {}
@@ -1043,7 +1056,7 @@ def execute_proxy_change(entry: dict, approver_id: str, approver_name: str):
                 post(f"⚠️ No full-net override found for `{ip}`")
 
         # ── Close Jira ticket: Approved ───────────────────────────────
-        jira_transition_ticket(jira_key, "Done")
+        jira_transition_ticket(jira_key, "Approved")
         _jira_update_labels(jira_key, add_labels=["approved"], remove_labels=["pending-approval"])
         timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
         jira_add_comment(
