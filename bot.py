@@ -812,9 +812,26 @@ def is_admin(user_id: str) -> bool:
     return user_id in SLACK_ADMIN_USER_IDS
 
 
-def build_approval_blocks(jira_key: str, summary_text: str, requester_name: str, jira_url: str) -> list:
+def build_approval_blocks(jira_key: str, command: str, args: dict, summary_text: str, requester_name: str, jira_url: str) -> list:
     """Build the Slack Block Kit approval card."""
     timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+    # Determine Change Type and Impact
+    change_type = command.capitalize()
+    target = args.get("domain", args.get("ip", "Unknown"))
+    impact = f"Client IP: {args.get('ip', 'Unknown')}"
+    if command == "full-net":
+        change_type = "Full Internet Access"
+        target = "All Domains"
+    elif command == "lock-net":
+        change_type = "Restore Restrictions"
+        target = "Restricted Domains"
+
+    action_value = json.dumps({
+        "ticket": jira_key,
+        "ts": int(datetime.now(timezone.utc).timestamp())
+    })
+
     return [
         {
             "type": "header",
@@ -829,13 +846,13 @@ def build_approval_blocks(jira_key: str, summary_text: str, requester_name: str,
             "text": {
                 "type": "mrkdwn",
                 "text": (
-                    f"*Ticket:*  `{jira_key}`\n"
-                    f"*Status:*  🟡 Pending Approval"
+                    f"📄 *Ticket:*  `{jira_key}`\n"
+                    f"📈 *Status:*  🟡 Pending Approval"
                 ),
             },
             "accessory": {
                 "type": "button",
-                "text": {"type": "plain_text", "text": "🔗 View in Jira", "emoji": True},
+                "text": {"type": "plain_text", "text": "View in Jira", "emoji": False},
                 "url": jira_url,
                 "action_id": "jira_link_button",
             },
@@ -843,19 +860,25 @@ def build_approval_blocks(jira_key: str, summary_text: str, requester_name: str,
         {"type": "divider"},
         {
             "type": "section",
-            "text": {"type": "mrkdwn", "text": summary_text},
+            "fields": [
+                {"type": "mrkdwn", "text": f"🛠️ *Change Type:*\n{change_type}"},
+                {"type": "mrkdwn", "text": f"🌍 *Target:*\n`{target}`"},
+                {"type": "mrkdwn", "text": f"⚠️ *Impact:*\n`{impact}`"},
+            ]
+        },
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": f"📝 *Justification / Details:*\n{summary_text}",
+            },
         },
         {"type": "divider"},
         {
             "type": "context",
             "elements": [
-                {
-                    "type": "mrkdwn",
-                    "text": (
-                        f"👤 *Requester:* {requester_name}  ·  "
-                        f"📅 {timestamp}"
-                    ),
-                }
+                {"type": "mrkdwn", "text": "🌐 *Environment:* 🔴 Production Proxy"},
+                {"type": "mrkdwn", "text": f"👤 *Requester:* {requester_name}  ·  📅 {timestamp}"}
             ],
         },
         {
@@ -863,17 +886,17 @@ def build_approval_blocks(jira_key: str, summary_text: str, requester_name: str,
             "elements": [
                 {
                     "type": "button",
-                    "text": {"type": "plain_text", "text": "✅  Approve", "emoji": True},
+                    "text": {"type": "plain_text", "text": "Approve", "emoji": False},
                     "style": "primary",
                     "action_id": "squid_approve",
-                    "value": jira_key,
+                    "value": action_value,
                     "confirm": {
                         "title": {"type": "plain_text", "text": "Confirm Approval"},
                         "text": {
                             "type": "mrkdwn",
                             "text": (
                                 f"Are you sure you want to *approve* `{jira_key}`?\n\n"
-                                "This will execute the proxy change immediately."
+                                "⚠️ This will modify proxy rules and may affect live traffic."
                             ),
                         },
                         "confirm": {"type": "plain_text", "text": "Yes, Approve"},
@@ -882,10 +905,10 @@ def build_approval_blocks(jira_key: str, summary_text: str, requester_name: str,
                 },
                 {
                     "type": "button",
-                    "text": {"type": "plain_text", "text": "❌  Reject", "emoji": True},
+                    "text": {"type": "plain_text", "text": "Reject", "emoji": False},
                     "style": "danger",
                     "action_id": "squid_reject",
-                    "value": jira_key,
+                    "value": action_value,
                     "confirm": {
                         "title": {"type": "plain_text", "text": "Confirm Rejection"},
                         "text": {
@@ -899,6 +922,43 @@ def build_approval_blocks(jira_key: str, summary_text: str, requester_name: str,
                         "deny": {"type": "plain_text", "text": "Cancel"},
                     },
                 },
+            ],
+        },
+    ]
+
+
+def build_progress_blocks(step: int, stage: str, target: str, total: int = 5) -> list:
+    filled = "⬛" * step
+    empty = "⬜" * (total - step)
+    bar = f"{filled}{empty}"
+
+    return [
+        {
+            "type": "header",
+            "text": {
+                "type": "plain_text",
+                "text": "⚙️ Executing Proxy Change",
+                "emoji": True
+            },
+        },
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": f"`{target}`\n*Stage:* {stage}",
+            },
+        },
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": f"`[{bar}]`",
+            },
+        },
+        {
+            "type": "context",
+            "elements": [
+                {"type": "mrkdwn", "text": f"Step {step}/{total}"},
             ],
         },
     ]
@@ -1017,7 +1077,7 @@ def _submit_ticket(command_name: str, summary: str, description: str, args: dict
             msg_result = app.client.chat_postMessage(
                 channel=SLACK_ADMIN_CHANNEL,
                 text=f"🎫 Proxy Change Request {jira_key} — awaiting approval",
-                blocks=build_approval_blocks(jira_key, summary_text, user_name, jira_url)
+                blocks=build_approval_blocks(jira_key, command_name, args, summary_text, user_name, jira_url)
             )
             with pending_lock:
                 pending = load_pending()
@@ -1061,21 +1121,35 @@ def execute_proxy_change(entry: dict, approver_id: str, approver_name: str):
     """
     Execute the actual Squid proxy change for an approved request.
     Designed to run in a background thread.
-    Posts updates to the requester's channel.
+    Posts updates to the requester's channel and updates progress UI for admins.
     """
     command_name      = entry["command"]
     args              = entry["args"]
     requester_channel = entry.get("requester_channel")
     jira_key          = entry["jira_key"]
+    
+    msg_ts = entry.get("slack_message_ts")
+    msg_ch = entry.get("slack_message_channel")
+    target_str = args.get("domain", args.get("ip", "Unknown Target"))
 
     def post(text, audit=False):
         _post_to_channel(requester_channel, text)
         if audit:
             audit_log(f"*[Ticket {jira_key}]*\n{text}")
 
+    def update_progress(step: int, stage: str, total: int = 5):
+        if not msg_ts or not msg_ch:
+            return
+        blocks = build_progress_blocks(step, stage, target_str, total)
+        try:
+            app.client.chat_update(channel=msg_ch, ts=msg_ts, blocks=blocks)
+        except Exception as e:
+            log.error(f"update_progress error: {e}")
+
     try:
         # ── /allow ──────────────────────────────────────────────────
         if command_name == "allow":
+            update_progress(1, "Validating request...", 5)
             ip               = args["ip"]
             domain           = args["domain"]
             expiry_timestamp = args.get("expiry_timestamp")
@@ -1084,6 +1158,7 @@ def execute_proxy_change(entry: dict, approver_id: str, approver_name: str):
             deps             = set()
 
             if is_dest_ip:
+                update_progress(2, "Applying IP destination bypass...", 5)
                 post(f"⚙️ Allowing destination IP `{domain}` for client `{ip}`...")
             else:
                 special_map = load_special_domains()
@@ -1092,17 +1167,20 @@ def execute_proxy_change(entry: dict, approver_id: str, approver_name: str):
                 matched_app  = special_map.get(root_domain)
 
                 if matched_app:
+                    update_progress(2, f"Applying {matched_app} override...", 5)
                     post(f"⚙️ Applying *{matched_app}* override for `{ip}`...")
                     base = classify(domain)
                     if base:
                         deps.add(base)
                 else:
+                    update_progress(2, "Scanning dependencies via Playwright...", 5)
                     post(f"⚙️ Processing `{domain}` for `{ip}`...")
                     deps = discover(domain, post)
                     base = classify(domain)
                     if base:
                         deps.add(base)
 
+            update_progress(3, "Rebuilding proxy configuration...", 5)
             with lock:
                 db = load_domains()
                 db[f"{ip}:{domain}"] = {
@@ -1117,6 +1195,7 @@ def execute_proxy_change(entry: dict, approver_id: str, approver_name: str):
             regenerate_squid_configs()
             rebuild_override_configs()
 
+            update_progress(4, "Reloading Squid Proxy...", 5)
             target_label = "Destination IP" if is_dest_ip else "Domain"
             post(
                 f"✅ *Access granted* (approved by <@{approver_id}>)\n"
@@ -1128,14 +1207,17 @@ def execute_proxy_change(entry: dict, approver_id: str, approver_name: str):
                 audit=True
             )
             reload_squid(channel=requester_channel)
+            update_progress(5, "Final verification...", 5)
 
         # ── /deny ───────────────────────────────────────────────────
         elif command_name == "deny":
+            update_progress(1, "Validating request...", 4)
             ip     = args["ip"]
             domain = args["domain"]
             key    = f"{ip}:{domain}"
             not_found = False
 
+            update_progress(2, "Modifying configuration...", 4)
             with lock:
                 db = load_domains()
                 if key not in db:
@@ -1150,15 +1232,18 @@ def execute_proxy_change(entry: dict, approver_id: str, approver_name: str):
             else:
                 regenerate_squid_configs()
                 rebuild_override_configs()
+                update_progress(3, "Reloading Squid Proxy...", 4)
                 post(
                     f"🚫 *Access removed* (approved by <@{approver_id}>)\n"
                     f"`{domain}` removed from `{ip}`. ⚙️ Reloading Squid...",
                     audit=True
                 )
                 reload_squid(channel=requester_channel)
+            update_progress(4, "Final verification...", 4)
 
         # ── /extend ─────────────────────────────────────────────────
         elif command_name == "extend":
+            update_progress(1, "Validating request...", 3)
             ip     = args["ip"]
             domain = args["domain"]
             hours  = args["hours"]
@@ -1166,6 +1251,7 @@ def execute_proxy_change(entry: dict, approver_id: str, approver_name: str):
             key    = f"{ip}:{domain}"
             result = None
 
+            update_progress(2, "Extending proxy lease...", 3)
             with lock:
                 db = load_domains()
                 if key not in db:
@@ -1194,9 +1280,11 @@ def execute_proxy_change(entry: dict, approver_id: str, approver_name: str):
                     f"• Added: `{hours}h`",
                     audit=True
                 )
+            update_progress(3, "Final verification...", 3)
 
         # ── /full-net ────────────────────────────────────────────────
         elif command_name == "full-net":
+            update_progress(1, "Validating request...", 4)
             ip        = args["ip"]
             safe_name = ip.replace(".", "_")
             path      = os.path.join(FULLNET_DIR, f"{ip}.conf")
@@ -1205,21 +1293,26 @@ def execute_proxy_change(entry: dict, approver_id: str, approver_name: str):
                 f"acl fullnet_{safe_name} src {ip}\n"
                 f"http_access allow fullnet_{safe_name}\n"
             )
+            update_progress(2, "Generating emergency overrides...", 4)
             with lock:
                 with open(path, "w") as f:
                     f.write(rule)
+            update_progress(3, "Reloading Squid Proxy...", 4)
             post(
                 f"🔓 *Full Internet Enabled* for `{ip}` "
                 f"(approved by <@{approver_id}>). ⚙️ Reloading Squid...",
                 audit=True
             )
             reload_squid(channel=requester_channel)
+            update_progress(4, "Final verification...", 4)
 
         # ── /lock-net ────────────────────────────────────────────────
         elif command_name == "lock-net":
+            update_progress(1, "Validating request...", 4)
             ip           = args["ip"]
             path         = os.path.join(FULLNET_DIR, f"{ip}.conf")
             did_disable  = False
+            update_progress(2, "Disabling overrides...", 4)
             with lock:
                 if os.path.exists(path):
                     with open(path, "w") as f:
@@ -1227,6 +1320,7 @@ def execute_proxy_change(entry: dict, approver_id: str, approver_name: str):
                     did_disable = True
 
             if did_disable:
+                update_progress(3, "Reloading Squid Proxy...", 4)
                 post(
                     f"🔒 *Restrictions Restored* for `{ip}` "
                     f"(approved by <@{approver_id}>). ⚙️ Reloading Squid...",
@@ -1235,6 +1329,7 @@ def execute_proxy_change(entry: dict, approver_id: str, approver_name: str):
                 reload_squid(channel=requester_channel)
             else:
                 post(f"⚠️ No full-net override found for `{ip}`")
+            update_progress(4, "Final verification...", 4)
 
         # ── Close Jira ticket: Approved ───────────────────────────────
         jira_transition_ticket(jira_key, "Approved")
@@ -1245,9 +1340,59 @@ def execute_proxy_change(entry: dict, approver_id: str, approver_name: str):
             f"APPROVED — executed by {approver_name} at {timestamp}"
         )
 
+        # FINAL SUCCESS UPDATE
+        if msg_ts and msg_ch:
+            app.client.chat_update(
+                channel=msg_ch,
+                ts=msg_ts,
+                blocks=[
+                    {
+                        "type": "header",
+                        "text": {
+                            "type": "plain_text",
+                            "text": "✅ Proxy Change Completed",
+                            "emoji": True
+                        },
+                    },
+                    {
+                        "type": "section",
+                        "text": {
+                            "type": "mrkdwn",
+                            "text": f"*Ticket:* `{jira_key}`\n*Status:* Success\n*Executed by:* <@{approver_id}>",
+                        },
+                    },
+                ]
+            )
+
     except Exception as e:
         log.error(f"execute_proxy_change [{jira_key}]: {e}")
         post(f"❌ Error executing approved request `{jira_key}`: {e}")
+        # FINAL FAILURE UPDATE
+        if msg_ts and msg_ch:
+            try:
+                app.client.chat_update(
+                    channel=msg_ch,
+                    ts=msg_ts,
+                    blocks=[
+                        {
+                            "type": "header",
+                            "text": {
+                                "type": "plain_text",
+                                "text": "❌ Execution Failed",
+                                "emoji": True
+                            },
+                        },
+                        {
+                            "type": "section",
+                            "text": {
+                                "type": "mrkdwn",
+                                "text": f"*Ticket:* `{jira_key}`\n*Error:* `{str(e)}`",
+                            },
+                        },
+                    ]
+                )
+            except Exception as inner_e:
+                log.error(f"Failed to post failure update: {inner_e}")
 
 
 # ------------------------------------------------
@@ -1545,7 +1690,7 @@ def allow_cmd(ack, respond, command):
         summary_text
     )
     if err:
-        respond(f"❌ Failed to create Jira ticket: {err}")
+        respond(f"Failed to create Jira ticket: {err}")
         return
 
     jira_url = f"{JIRA_BASE_URL}/browse/{jira_key}"
@@ -1607,7 +1752,7 @@ def deny_cmd(ack, respond, command):
         summary_text
     )
     if err:
-        respond(f"❌ Failed to create Jira ticket: {err}")
+        respond(f"Failed to create Jira ticket: {err}")
         return
 
     jira_url = f"{JIRA_BASE_URL}/browse/{jira_key}"
@@ -1678,7 +1823,7 @@ def extend_cmd(ack, respond, command):
         summary_text
     )
     if err:
-        respond(f"❌ Failed to create Jira ticket: {err}")
+        respond(f"Failed to create Jira ticket: {err}")
         return
 
     jira_url = f"{JIRA_BASE_URL}/browse/{jira_key}"
@@ -1726,7 +1871,7 @@ def fullnet_cmd(ack, respond, command):
         summary_text
     )
     if err:
-        respond(f"❌ Failed to create Jira ticket: {err}")
+        respond(f"Failed to create Jira ticket: {err}")
         return
 
     jira_url = f"{JIRA_BASE_URL}/browse/{jira_key}"
@@ -1773,7 +1918,7 @@ def locknet_cmd(ack, respond, command):
         summary_text
     )
     if err:
-        respond(f"❌ Failed to create Jira ticket: {err}")
+        respond(f"Failed to create Jira ticket: {err}")
         return
 
     jira_url = f"{JIRA_BASE_URL}/browse/{jira_key}"
@@ -1854,7 +1999,14 @@ def handle_approve(ack, body, client):
             log.error(f"handle_approve: ephemeral error: {e}")
         return
 
-    jira_key = body["actions"][0]["value"]
+    raw_value = body["actions"][0]["value"]
+    try:
+        val_data = json.loads(raw_value)
+        jira_key = val_data["ticket"]
+    except (json.JSONDecodeError, KeyError):
+        jira_key = raw_value
+
+    audit_log(f"*[Audit]* User <@{actor_id}> clicked APPROVE for ticket {jira_key}")
 
     # Claim the request atomically
     with pending_lock:
@@ -1890,7 +2042,7 @@ def handle_approve(ack, body, client):
     # Update the approval card immediately
     _update_approval_card(
         client, entry,
-        f"✅ *{jira_key}* approved by *{actor_name}* — executing...",
+        f"🟢 *Approved by <@{actor_id}>*\nStarting execution...",
         actor_name
     )
 
@@ -1919,7 +2071,14 @@ def handle_reject(ack, body, client):
             log.error(f"handle_reject: ephemeral error: {e}")
         return
 
-    jira_key = body["actions"][0]["value"]
+    raw_value = body["actions"][0]["value"]
+    try:
+        val_data = json.loads(raw_value)
+        jira_key = val_data["ticket"]
+    except (json.JSONDecodeError, KeyError):
+        jira_key = raw_value
+
+    audit_log(f"*[Audit]* User <@{actor_id}> clicked REJECT for ticket {jira_key}")
 
     # Claim the request atomically
     with pending_lock:
@@ -1955,7 +2114,7 @@ def handle_reject(ack, body, client):
     # Update the approval card
     _update_approval_card(
         client, entry,
-        f"❌ *{jira_key}* rejected by *{actor_name}*",
+        f"Rejected *{jira_key}* by *{actor_name}*",
         actor_name
     )
 
@@ -1967,12 +2126,12 @@ def handle_reject(ack, body, client):
             client.chat_postMessage(
                 channel=requester_channel,
                 text=(
-                    f"❌ *Your request was rejected — {jira_key}*\n"
+                    f"Your request was rejected — {jira_key}*\n"
                     f"• Rejected by: <@{actor_id}>\n"
                     f"🔗 {jira_url}"
                 )
             )
-            audit_log(f"❌ *[Ticket {jira_key}] Rejected*\n• Rejected by <@{actor_id}>")
+            audit_log(f"[Ticket {jira_key}] Rejected*\n• Rejected by <@{actor_id}>")
         except Exception as e:
             log.error(f"handle_reject: failed to notify requester: {e}")
 
