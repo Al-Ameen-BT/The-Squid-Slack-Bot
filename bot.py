@@ -48,7 +48,7 @@ LIST_DIR         = "/etc/squid/lists"
 DOMAINS_FILE     = "/etc/squid/domains.json"
 FULLNET_DIR      = "/etc/squid/conf.d/fullnet"
 OVERRIDE_DIR     = "/etc/squid/conf.d/override"
-ULTRAVIEWER_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ultraviewer.txt")
+SPECIAL_APPS_DIR = "/etc/squid/special_apps"
 CDN_DOMAINS_FILE = "/etc/squid/cdn_domains.txt"
 DOMAIN_CONF      = "/etc/squid/conf.d/02-domain-lists.conf"
 HOSTS_CONF       = "/etc/squid/conf.d/01-hosts.conf"
@@ -61,6 +61,7 @@ PENDING_FILE       = os.path.join(os.path.dirname(os.path.abspath(__file__)), "p
 # STARTUP GUARD
 os.makedirs(FULLNET_DIR, exist_ok=True)
 os.makedirs(OVERRIDE_DIR, exist_ok=True)
+os.makedirs(SPECIAL_APPS_DIR, exist_ok=True)
 os.makedirs(LIST_DIR, exist_ok=True)
 os.makedirs(f"{LIST_DIR}/groups", exist_ok=True)
 
@@ -126,29 +127,36 @@ def load_filter_config():
         return defaults_blocklist, defaults_types
 
 
-def load_special_domains():
+def load_special_domains() -> dict:
     """
     Reads the special_domains section from filter_config.json.
-    Returns a flat set of root domains that trigger the UltraViewer-style
-    handler workflow (static domain list instead of Playwright scan).
+    Returns a dict mapping root domains to their app name, e.g.:
+      {"ultraviewer.net": "ultraviewer", "teamviewer.com": "teamviewer"}
+
+    The app name corresponds to a list file at:
+      /etc/squid/special_apps/<app_name>.txt
 
     Example config entry:
-      "special_domains": { "ultraviewer": ["ultraviewer.net", "ultraviewer.com"] }
+      "special_domains": {
+          "ultraviewer": ["ultraviewer.net", "ultraviewer.com"],
+          "teamviewer":  ["teamviewer.com", "teamviewer.net"]
+      }
     """
     if not os.path.exists(FILTER_CONFIG_FILE):
-        return set()
+        return {}
     try:
         with open(FILTER_CONFIG_FILE, "r") as f:
             cfg = json.load(f)
-        result = set()
-        for category, entries in cfg.get("special_domains", {}).items():
-            if category == "_comment" or not isinstance(entries, list):
+        result = {}
+        for app_name, entries in cfg.get("special_domains", {}).items():
+            if app_name == "_comment" or not isinstance(entries, list):
                 continue
-            result.update(d.lower().strip() for d in entries)
+            for d in entries:
+                result[d.lower().strip()] = app_name
         return result
     except Exception as e:
         log.warning(f"load_special_domains: {e}")
-        return set()
+        return {}
 
 
 def get_cdn_domains():
@@ -341,37 +349,99 @@ def regenerate_squid_configs():
 
 def rebuild_override_configs():
     """
-    Rebuilds /etc/squid/conf.d/override/ultraviewer.conf based on active db entries.
+    Rebuilds /etc/squid/conf.d/override/<app_name>.conf for every special app
+    that has active client IPs in the database.
+
+    For each app:
+      1. Reads /etc/squid/special_apps/<app_name>.txt (mixed domains + IPs)
+      2. Splits into <app_name>.domains.txt and <app_name>.ips.txt
+      3. Generates /etc/squid/conf.d/override/<app_name>.conf with proper ACLs
+      4. Cleans up .conf files for apps that no longer have active clients
+
     Called outside lock.
     """
     os.makedirs(OVERRIDE_DIR, exist_ok=True)
-    conf_path = os.path.join(OVERRIDE_DIR, "ultraviewer.conf")
 
     db = load_domains()
-    special = load_special_domains()  # config-driven: reads special_domains from filter_config.json
-    uv_ips = set()
+    special = load_special_domains()  # dict: root_domain → app_name
+
+    # Build a mapping: app_name → set of client IPs that have active rules
+    app_ips = {}  # { "ultraviewer": {"192.168.1.50", ...}, ... }
     for entry in db.values():
         d = entry["domain"].lower()
         if validate_ip(d):
             continue
         ext = tldextract.extract(d)
         root = f"{ext.domain}.{ext.suffix}" if ext.domain and ext.suffix else d
-        if root in special:
-            uv_ips.add(entry["ip"])
+        app_name = special.get(root)
+        if app_name:
+            app_ips.setdefault(app_name, set()).add(entry["ip"])
 
-    if not uv_ips:
-        if os.path.exists(conf_path):
-            os.remove(conf_path)
-    else:
-        ip_list_str = " ".join(uv_ips)
+    # Collect all known app names from config (to clean up stale .conf files)
+    all_app_names = set(special.values())
+
+    for app_name in all_app_names:
+        conf_path = os.path.join(OVERRIDE_DIR, f"{app_name}.conf")
+        ips = app_ips.get(app_name)
+
+        if not ips:
+            # No active clients — remove the override conf if it exists
+            if os.path.exists(conf_path):
+                os.remove(conf_path)
+                log.info(f"rebuild_override_configs: removed {conf_path} (no active clients)")
+            continue
+
+        # Read the app's master list file from /etc/squid/special_apps/
+        list_file = os.path.join(SPECIAL_APPS_DIR, f"{app_name}.txt")
+        app_domains = []
+        app_dst_ips = []
+
+        if os.path.exists(list_file):
+            with open(list_file, "r") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    # Lines starting with a digit are IPs or CIDR ranges
+                    if line[0].isdigit():
+                        app_dst_ips.append(line)
+                    else:
+                        app_domains.append(line)
+        else:
+            log.warning(
+                f"rebuild_override_configs: list file missing for '{app_name}': {list_file}"
+            )
+
+        # Write split files for Squid (dstdomain cannot parse raw IPs)
+        dom_file = os.path.join(SPECIAL_APPS_DIR, f"{app_name}.domains.txt")
+        ip_file  = os.path.join(SPECIAL_APPS_DIR, f"{app_name}.ips.txt")
+
+        with open(dom_file, "w") as f:
+            f.write("\n".join(app_domains) + "\n" if app_domains else "")
+        with open(ip_file, "w") as f:
+            f.write("\n".join(app_dst_ips) + "\n" if app_dst_ips else "")
+
+        # Build the Squid override config
+        safe_name   = app_name.replace("-", "_")
+        ip_list_str = " ".join(ips)
+
         rule = (
-            f"# Auto Generated UltraViewer Override\n"
-            f"acl uv_src src {ip_list_str}\n"
-            f"acl uv_dst dstdomain \"{ULTRAVIEWER_FILE}\"\n"
-            f"http_access allow uv_src uv_dst\n"
+            f"# Auto Generated Override — {app_name}\n"
+            f"acl {safe_name}_src src {ip_list_str}\n"
         )
+        if app_domains:
+            rule += f'acl {safe_name}_dst_dom dstdomain "{dom_file}"\n'
+            rule += f"http_access allow {safe_name}_src {safe_name}_dst_dom\n"
+        if app_dst_ips:
+            rule += f'acl {safe_name}_dst_ip dst "{ip_file}"\n'
+            rule += f"http_access allow {safe_name}_src {safe_name}_dst_ip\n"
+
         with open(conf_path, "w") as f:
             f.write(rule)
+        log.info(
+            f"rebuild_override_configs: wrote {conf_path} — "
+            f"{len(ips)} client(s), {len(app_domains)} domains, {len(app_dst_ips)} IPs"
+        )
 
 
 # ------------------------------------------------
@@ -742,27 +812,52 @@ def is_admin(user_id: str) -> bool:
     return user_id in SLACK_ADMIN_USER_IDS
 
 
-def build_approval_blocks(jira_key: str, summary_text: str, requester_name: str) -> list:
+def build_approval_blocks(jira_key: str, summary_text: str, requester_name: str, jira_url: str) -> list:
     """Build the Slack Block Kit approval card."""
+    timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     return [
         {
             "type": "header",
-            "text": {"type": "plain_text", "text": f"🎫 Proxy Change Request — {jira_key}", "emoji": True}
+            "text": {
+                "type": "plain_text",
+                "text": "🔔  Proxy Change Request",
+                "emoji": True,
+            },
         },
         {
             "type": "section",
-            "text": {"type": "mrkdwn", "text": summary_text}
+            "text": {
+                "type": "mrkdwn",
+                "text": (
+                    f"*Ticket:*  `{jira_key}`\n"
+                    f"*Status:*  🟡 Pending Approval"
+                ),
+            },
+            "accessory": {
+                "type": "button",
+                "text": {"type": "plain_text", "text": "🔗 View in Jira", "emoji": True},
+                "url": jira_url,
+                "action_id": "jira_link_button",
+            },
         },
+        {"type": "divider"},
+        {
+            "type": "section",
+            "text": {"type": "mrkdwn", "text": summary_text},
+        },
+        {"type": "divider"},
         {
             "type": "context",
             "elements": [
                 {
                     "type": "mrkdwn",
-                    "text": f"👤 Requested by *{requester_name}*"
+                    "text": (
+                        f"👤 *Requester:* {requester_name}  ·  "
+                        f"📅 {timestamp}"
+                    ),
                 }
-            ]
+            ],
         },
-        {"type": "divider"},
         {
             "type": "actions",
             "elements": [
@@ -771,17 +866,41 @@ def build_approval_blocks(jira_key: str, summary_text: str, requester_name: str)
                     "text": {"type": "plain_text", "text": "✅  Approve", "emoji": True},
                     "style": "primary",
                     "action_id": "squid_approve",
-                    "value": jira_key
+                    "value": jira_key,
+                    "confirm": {
+                        "title": {"type": "plain_text", "text": "Confirm Approval"},
+                        "text": {
+                            "type": "mrkdwn",
+                            "text": (
+                                f"Are you sure you want to *approve* `{jira_key}`?\n\n"
+                                "This will execute the proxy change immediately."
+                            ),
+                        },
+                        "confirm": {"type": "plain_text", "text": "Yes, Approve"},
+                        "deny": {"type": "plain_text", "text": "Cancel"},
+                    },
                 },
                 {
                     "type": "button",
                     "text": {"type": "plain_text", "text": "❌  Reject", "emoji": True},
                     "style": "danger",
                     "action_id": "squid_reject",
-                    "value": jira_key
-                }
-            ]
-        }
+                    "value": jira_key,
+                    "confirm": {
+                        "title": {"type": "plain_text", "text": "Confirm Rejection"},
+                        "text": {
+                            "type": "mrkdwn",
+                            "text": (
+                                f"Are you sure you want to *reject* `{jira_key}`?\n\n"
+                                "The requester will be notified."
+                            ),
+                        },
+                        "confirm": {"type": "plain_text", "text": "Yes, Reject"},
+                        "deny": {"type": "plain_text", "text": "Cancel"},
+                    },
+                },
+            ],
+        },
     ]
 
 
@@ -791,6 +910,30 @@ def _update_approval_card(client, entry: dict, status_text: str, actor_name: str
     msg_ch  = entry.get("slack_message_channel")
     if not msg_ts or not msg_ch:
         return
+
+    jira_key  = entry.get("jira_key", "???")
+    command   = entry.get("command", "unknown")
+    requester = entry.get("requester_name", "unknown")
+    timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+    # Determine the status indicator
+    is_approved = "approved" in status_text.lower()
+    status_icon = "🟢" if is_approved else "🔴"
+    status_label = "Approved" if is_approved else "Rejected"
+
+    # Reconstruct a summary from the stored args
+    args = entry.get("args", {})
+    detail_parts = []
+    if args.get("ip"):
+        detail_parts.append(f"*Client IP:* `{args['ip']}`")
+    if args.get("domain"):
+        detail_parts.append(f"*Target:* `{args['domain']}`")
+    if args.get("hours"):
+        detail_parts.append(f"*Extension:* `{args['hours']}h`")
+    if args.get("time_text"):
+        detail_parts.append(f"*Duration:* {args['time_text']}")
+    detail_text = "\n".join(detail_parts) if detail_parts else "_No details available_"
+
     try:
         client.chat_update(
             channel=msg_ch,
@@ -798,16 +941,38 @@ def _update_approval_card(client, entry: dict, status_text: str, actor_name: str
             text=status_text,
             blocks=[
                 {
-                    "type": "section",
-                    "text": {"type": "mrkdwn", "text": status_text}
+                    "type": "header",
+                    "text": {
+                        "type": "plain_text",
+                        "text": f"{status_icon}  Request {status_label} — {jira_key}",
+                        "emoji": True,
+                    },
                 },
+                {
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": (
+                            f"*Command:* `/{command}`\n"
+                            f"{detail_text}"
+                        ),
+                    },
+                },
+                {"type": "divider"},
                 {
                     "type": "context",
                     "elements": [
-                        {"type": "mrkdwn", "text": f"Actioned by *{actor_name}*"}
-                    ]
-                }
-            ]
+                        {
+                            "type": "mrkdwn",
+                            "text": (
+                                f"👤 Requested by *{requester}*  ·  "
+                                f"⚡ {status_label} by *{actor_name}*  ·  "
+                                f"📅 {timestamp}"
+                            ),
+                        }
+                    ],
+                },
+            ],
         )
     except Exception as e:
         log.error(f"_update_approval_card: {e}")
@@ -815,7 +980,7 @@ def _update_approval_card(client, entry: dict, status_text: str, actor_name: str
 
 def _submit_ticket(command_name: str, summary: str, description: str, args: dict,
                    user_id: str, user_name: str, channel_id: str,
-                   summary_text: str) -> str | None:
+                   summary_text: str) -> tuple:
     """
     Core helper called by every slash command handler.
     Creates the Jira ticket, saves it to pending_requests.json,
@@ -921,13 +1086,13 @@ def execute_proxy_change(entry: dict, approver_id: str, approver_name: str):
             if is_dest_ip:
                 post(f"⚙️ Allowing destination IP `{domain}` for client `{ip}`...")
             else:
-                ULTRAVIEWER_DOMAINS = load_special_domains()
+                special_map = load_special_domains()
                 ext = tldextract.extract(domain)
                 root_domain  = f"{ext.domain}.{ext.suffix}"
-                is_ultraviewer = root_domain in ULTRAVIEWER_DOMAINS
+                matched_app  = special_map.get(root_domain)
 
-                if is_ultraviewer:
-                    post(f"⚙️ Applying UltraViewer override for `{ip}`...")
+                if matched_app:
+                    post(f"⚙️ Applying *{matched_app}* override for `{ip}`...")
                     base = classify(domain)
                     if base:
                         deps.add(base)
@@ -1820,6 +1985,12 @@ def handle_reject(ack, body, client):
         jira_add_comment(jira_key, f"REJECTED — by {actor_name} at {timestamp}")
 
     threading.Thread(target=_close, daemon=True).start()
+
+
+@app.action("jira_link_button")
+def handle_jira_link(ack, body):
+    """No-op handler — the Jira button uses a URL action, but Slack still sends an interaction payload."""
+    ack()
 
 
 # ------------------------------------------------
