@@ -18,7 +18,9 @@ The python bot needs to manage and manipulate specific ACL file locations that a
 
 ```bash
 sudo mkdir -p /etc/squid/conf.d/fullnet
+sudo mkdir -p /etc/squid/conf.d/override
 sudo mkdir -p /etc/squid/lists/groups
+sudo mkdir -p /etc/squid/special_apps
 ```
 
 By default, the script looks for an external file `/etc/squid/cdn_domains.txt` to avoid blocking common global CDNs (e.g. Cloudflare, Akamai etc). Optional, but recommended.
